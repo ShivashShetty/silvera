@@ -1,0 +1,20 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local data and uploaded documents
+data/
+uploads/
+
+# Editors and operating systems
+.vscode/
+.DS_Store
+Thumbs.db
