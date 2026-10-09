@@ -1,18 +1,44 @@
-
 import { useEffect, useRef, useState } from "react";
+
 import {
   getSilveraStatus,
   uploadDocument,
-  searchDocuments,
+  askSilvera,
   getDocuments,
   deleteDocument,
+  getOriginalDocumentUrl,
   type DocumentUploadResult,
-  type DocumentSearchResponse,
+  type AskResponse,
+  type AskSource,
   type StoredDocument,
 } from "./services/api";
+
 import "./App.css";
 
 type Page = "intelligence" | "documents";
+
+function formatAnswerLine(line: string, index: number) {
+  const trimmed = line.trim();
+
+  if (!trimmed) {
+    return <div className="answer-spacer" key={index} />;
+  }
+
+  const bullet = trimmed.match(/^(?:[-*•]|\d+[.)])\s+(.+)$/);
+
+  if (bullet) {
+    return (
+      <div className="answer-list-item" key={index}>
+        <span className="answer-bullet">
+          {trimmed.match(/^\d+[.)]/)?.[0] ?? "•"}
+        </span>
+        <span>{bullet[1]}</span>
+      </div>
+    );
+  }
+
+  return <p key={index}>{trimmed}</p>;
+}
 
 function App() {
   const [question, setQuestion] = useState("");
@@ -28,7 +54,11 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [searchResult, setSearchResult] =
-    useState<DocumentSearchResponse | null>(null);
+    useState<AskResponse | null>(null);
+
+  const [selectedSource, setSelectedSource] = useState<AskSource | null>(
+    null
+  );
 
   const [documents, setDocuments] = useState<StoredDocument[]>([]);
   const [documentsLoading, setDocumentsLoading] = useState(false);
@@ -41,6 +71,18 @@ function App() {
     getSilveraStatus()
       .then(() => setBackendStatus("online"))
       .catch(() => setBackendStatus("offline"));
+  }, []);
+
+  useEffect(() => {
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setSelectedSource(null);
+      }
+    }
+
+    window.addEventListener("keydown", handleEscape);
+
+    return () => window.removeEventListener("keydown", handleEscape);
   }, []);
 
   async function loadDocuments() {
@@ -70,6 +112,7 @@ function App() {
 
     try {
       const result = await uploadDocument(selectedFile);
+
       setUploadResult(result);
       setSelectedFile(null);
 
@@ -91,18 +134,22 @@ function App() {
 
   async function handleSearch() {
     const query = question.trim();
+
     if (!query || searching) return;
 
     setSearching(true);
     setSearchError("");
     setSearchResult(null);
+    setSelectedSource(null);
 
     try {
-      const result = await searchDocuments(query);
+      const result = await askSilvera(query);
       setSearchResult(result);
     } catch (error) {
       setSearchError(
-        error instanceof Error ? error.message : "Search failed."
+        error instanceof Error
+          ? error.message
+          : "Silvera could not generate an answer."
       );
     } finally {
       setSearching(false);
@@ -111,7 +158,7 @@ function App() {
 
   async function handleDelete(document: StoredDocument) {
     const confirmed = window.confirm(
-      `Delete "${document.filename}"? Its extracted text and metadata will be removed.`
+      `Delete "${document.filename}"? Its extracted text, metadata, original PDF, and search index will be removed from Silvera.`
     );
 
     if (!confirmed || deletingId) return;
@@ -128,17 +175,22 @@ function App() {
         )
       );
 
-      // Refresh current search so deleted content disappears.
-      if (searchResult) {
-        try {
-          const updatedResults = await searchDocuments(
-            searchResult.query
-          );
-          setSearchResult(updatedResults);
-        } catch {
-          setSearchResult(null);
-        }
+      if (
+        searchResult?.sources.some(
+          (source) => source.document_id === document.document_id
+        )
+      ) {
+        setSearchResult(null);
+        setSearchError(
+          "A source document was deleted. Ask your question again to generate a new answer."
+        );
       }
+
+      if (selectedSource?.document_id === document.document_id) {
+        setSelectedSource(null);
+      }
+
+      await loadDocuments();
     } catch (error) {
       setDocumentsError(
         error instanceof Error
@@ -150,11 +202,6 @@ function App() {
     }
   }
 
-  function openDocuments() {
-    setActivePage("documents");
-    void loadDocuments();
-  }
-
   function resetWorkspace() {
     setQuestion("");
     setSearchResult(null);
@@ -162,7 +209,21 @@ function App() {
     setUploadResult(null);
     setUploadError("");
     setSelectedFile(null);
+    setSelectedSource(null);
     setActivePage("intelligence");
+  }
+
+  function openDocuments() {
+    setActivePage("documents");
+    void loadDocuments();
+  }
+
+  function openOriginalDocument() {
+    if (!selectedSource) return;
+
+    const url = getOriginalDocumentUrl(selectedSource.document_id);
+
+    window.open(url, "_blank", "noopener,noreferrer");
   }
 
   return (
@@ -171,6 +232,7 @@ function App() {
         <h2 className="brand">
           silver<span>a.</span>
         </h2>
+
         <p className="tagline">SECURE ENTERPRISE INTELLIGENCE</p>
 
         <button className="new-chat" onClick={resetWorkspace}>
@@ -229,9 +291,7 @@ function App() {
         <header className="topbar">
           <span>
             Workspace /{" "}
-            {activePage === "intelligence"
-              ? "Intelligence"
-              : "Documents"}
+            {activePage === "intelligence" ? "Intelligence" : "Documents"}
           </span>
 
           <div className="user">
@@ -259,35 +319,38 @@ function App() {
               <div className="search-box">
                 <textarea
                   value={question}
-                  onChange={(e) => setQuestion(e.target.value)}
-                  onKeyDown={(e) => {
+                  onChange={(event) => setQuestion(event.target.value)}
+                  onKeyDown={(event) => {
                     if (
-                      e.key === "Enter" &&
-                      !e.shiftKey &&
+                      event.key === "Enter" &&
+                      !event.shiftKey &&
                       !searching
                     ) {
-                      e.preventDefault();
+                      event.preventDefault();
                       void handleSearch();
                     }
                   }}
-                  placeholder="Search your documents..."
+                  placeholder="Ask a question about your documents..."
                   rows={3}
+                  maxLength={1000}
+                  aria-label="Ask Silvera a question"
                 />
 
                 <div className="search-footer">
-                  <span>↳ Document keyword search</span>
+                  <span>↳ AI-powered document Q&amp;A</span>
+
                   <button
                     onClick={() => void handleSearch()}
                     disabled={!question.trim() || searching}
                   >
-                    {searching ? "Searching..." : "Ask Silvera ↗"}
+                    {searching ? "Thinking..." : "Ask Silvera ↗"}
                   </button>
                 </div>
               </div>
 
               <p className="notice">
-                <span>◇</span> Silvera searches the text of your uploaded
-                documents. AI-generated answers are coming next.
+                <span>◇</span> Answers grounded in your documents,
+                powered by your local AI model.
               </p>
 
               {searchError && (
@@ -296,30 +359,101 @@ function App() {
                 </div>
               )}
 
-              {searchResult && (
-                <div className="search-results" aria-live="polite">
-                  <h3>Search results</h3>
-                  <p>
-                    Found {searchResult.total_results} matching
-                    passage(s) for "{searchResult.query}".
-                  </p>
+              {searching && (
+                <div className="search-results loading-answer" role="status">
+                  <span className="loading-orb" />
+                  <p>Searching your knowledge base...</p>
+                  <span>Silvera is preparing your answer</span>
+                </div>
+              )}
 
-                  {searchResult.results.length === 0 ? (
-                    <p>
-                      No matching passages found. Try other keywords
-                      or upload a document first.
-                    </p>
-                  ) : (
-                    searchResult.results.map((result, index) => (
-                      <article
-                        className="search-result"
-                        key={`${result.document_id}-${index}`}
-                      >
-                        <p>{result.passage}</p>
-                        <span>Source: {result.filename}</span>
-                      </article>
-                    ))
-                  )}
+              {searchResult && (
+                <div
+                  className="search-results answer-workspace"
+                  aria-live="polite"
+                >
+                  <div className="answer-heading">
+                    <div>
+                      <span className="answer-kicker">RESPONSE</span>
+                      <h3>Silvera&apos;s answer</h3>
+                    </div>
+
+                    <span className="model-pill">
+                      <span className="model-dot" />
+                      {searchResult.model}
+                    </span>
+                  </div>
+
+                  <article className="search-result ai-answer">
+                    <div className="answer-content">
+                      {searchResult.answer
+                        .split("\n")
+                        .map((line, index) =>
+                          formatAnswerLine(line, index)
+                        )}
+                    </div>
+
+                    <div className="answer-bottom">
+                      <span>
+                        <span className="privacy-symbol">◇</span>
+                        Generated locally
+                      </span>
+
+                      <span>
+                        {searchResult.total_sources} source passage
+                        {searchResult.total_sources === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                  </article>
+
+                  <div className="sources-section">
+                    <div className="sources-heading">
+                      <div>
+                        <h4>Sources</h4>
+                        <p>Evidence retrieved from your documents</p>
+                      </div>
+
+                      <span className="source-count">
+                        {searchResult.sources.length}
+                      </span>
+                    </div>
+
+                    {searchResult.sources.length === 0 ? (
+                      <p className="empty-sources">
+                        No source passages were returned for this answer.
+                      </p>
+                    ) : (
+                      <div className="source-chips">
+                        {searchResult.sources.map((source, index) => (
+                          <button
+                            className="source-chip"
+                            key={`${source.document_id}-${source.chunk_index}-${index}`}
+                            onClick={() => setSelectedSource(source)}
+                            title={`View source: ${source.filename}`}
+                            aria-label={`View source ${source.filename}`}
+                          >
+                            <span className="source-file-icon">▤</span>
+
+                            <span className="source-chip-text">
+                              <span className="source-chip-label">
+                                {source.filename}
+                              </span>
+
+                              <span className="source-chip-meta">
+                                {source.similarity != null
+                                  ? `${(
+                                      source.similarity * 100
+                                    ).toFixed(1)}% match`
+                                  : "Source passage"}
+                              </span>
+                            </span>
+
+                            <span className="source-open-icon">↗</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </section>
@@ -334,8 +468,10 @@ function App() {
                 <article className="feature-card">
                   <div className="feature-icon">▤</div>
                   <h3>Knowledge intelligence</h3>
+
                   <p>
-                    Upload PDF documents and search their extracted text.
+                    Upload PDF documents and ask questions about their
+                    extracted text.
                   </p>
 
                   <input
@@ -343,8 +479,8 @@ function App() {
                     type="file"
                     accept=".pdf,application/pdf"
                     hidden
-                    onChange={(e) => {
-                      setSelectedFile(e.target.files?.[0] ?? null);
+                    onChange={(event) => {
+                      setSelectedFile(event.target.files?.[0] ?? null);
                       setUploadError("");
                       setUploadResult(null);
                     }}
@@ -362,23 +498,19 @@ function App() {
                   {selectedFile && (
                     <div className="upload-details">
                       <p>Selected: {selectedFile.name}</p>
+
                       <p>
                         Size:{" "}
-                        {(
-                          selectedFile.size /
-                          (1024 * 1024)
-                        ).toFixed(2)}{" "}
-                        MB
+                        {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB
                       </p>
+
                       <button
                         className="upload-button"
                         type="button"
                         onClick={() => void handleUpload()}
                         disabled={uploading}
                       >
-                        {uploading
-                          ? "Uploading..."
-                          : "Upload document ↑"}
+                        {uploading ? "Uploading..." : "Upload document ↑"}
                       </button>
                     </div>
                   )}
@@ -393,10 +525,12 @@ function App() {
                     <div className="upload-success" role="status">
                       <p>✓ {uploadResult.message}</p>
                       <p>Pages: {uploadResult.pages}</p>
+
                       <p>
                         Characters extracted:{" "}
                         {uploadResult.characters_extracted}
                       </p>
+
                       <details>
                         <summary>View extracted text</summary>
                         <pre>{uploadResult.preview}</pre>
@@ -408,20 +542,24 @@ function App() {
                 <article className="feature-card">
                   <div className="feature-icon">⌘</div>
                   <h3>Data intelligence</h3>
+
                   <p>
                     Ask questions about business data and uncover useful
                     insights without writing SQL.
                   </p>
+
                   <span className="feature-status">PLANNED</span>
                 </article>
 
                 <article className="feature-card">
                   <div className="feature-icon">⬡</div>
-                  <h3>Security & governance</h3>
+                  <h3>Security &amp; governance</h3>
+
                   <p>
                     Build toward controlled access, audit trails and
                     permission-aware AI retrieval.
                   </p>
+
                   <span className="feature-status">PLANNED</span>
                 </article>
               </div>
@@ -437,6 +575,7 @@ function App() {
             </div>
 
             <h1>Document library</h1>
+
             <p className="description">
               Manage the documents stored in your Silvera workspace.
             </p>
@@ -447,9 +586,7 @@ function App() {
                 onClick={() => void loadDocuments()}
                 disabled={documentsLoading}
               >
-                {documentsLoading
-                  ? "Refreshing..."
-                  : "↻ Refresh documents"}
+                {documentsLoading ? "Refreshing..." : "↻ Refresh documents"}
               </button>
 
               <button
@@ -473,6 +610,7 @@ function App() {
                 <div className="feature-icon">▤</div>
                 <h3>No documents yet</h3>
                 <p>Upload a PDF to start building your knowledge base.</p>
+
                 <button
                   className="new-chat"
                   onClick={() => setActivePage("intelligence")}
@@ -491,8 +629,10 @@ function App() {
                   >
                     <div className="document-info">
                       <div className="feature-icon">▤</div>
+
                       <div>
                         <h3>{document.filename}</h3>
+
                         <p>
                           {document.pages == null
                             ? "Page count unavailable"
@@ -501,6 +641,7 @@ function App() {
                           {document.characters_extracted.toLocaleString()}{" "}
                           characters
                         </p>
+
                         <p>
                           {document.uploaded_at
                             ? `Uploaded ${new Date(
@@ -532,6 +673,79 @@ function App() {
           <span>PRIVATE BY DESIGN · BUILT LOCALLY</span>
         </footer>
       </main>
+
+      {selectedSource && (
+        <div
+          className="source-modal-backdrop"
+          onClick={() => setSelectedSource(null)}
+          role="presentation"
+        >
+          <section
+            className="source-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="source-modal-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="source-modal-header">
+              <div className="source-modal-title-icon">▤</div>
+
+              <div className="source-modal-heading">
+                <span className="answer-kicker">SOURCE DOCUMENT</span>
+                <h3 id="source-modal-title">Retrieved passage</h3>
+              </div>
+            </div>
+
+            <div className="source-modal-file">
+              <div className="source-modal-file-info">
+                <span className="source-modal-filename">
+                  {selectedSource.filename}
+                </span>
+
+                <span className="source-modal-subtitle">
+                  Retrieved from your local knowledge base
+                </span>
+              </div>
+            </div>
+
+            {selectedSource.similarity != null && (
+              <div className="source-relevance">
+                <span>Semantic similarity</span>
+                <span>
+                  {(selectedSource.similarity * 100).toFixed(1)}%
+                </span>
+              </div>
+            )}
+
+            <div className="source-modal-body">
+              <span className="answer-kicker">PASSAGE CONTENT</span>
+              <p className="passage-content">{selectedSource.passage}</p>
+            </div>
+
+            <div className="source-modal-footer">
+              <span>◇ Stored and processed locally</span>
+
+              <div className="source-modal-actions">
+                <button
+                  className="source-open-original"
+                  onClick={openOriginalDocument}
+                  type="button"
+                >
+                  Open original ↗
+                </button>
+
+                <button
+                  className="source-done-button"
+                  onClick={() => setSelectedSource(null)}
+                  type="button"
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

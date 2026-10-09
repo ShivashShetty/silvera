@@ -4,15 +4,24 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
-
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
+
+from services.semantic_search import (
+    index_document,
+    search_similar_documents,
+    delete_document_vectors,
+)
+from services.local_ai import generate_answer
+
 
 app = FastAPI(
     title="Silvera API",
     description="Secure Enterprise Intelligence",
-    version="0.3.0",
+    version="0.5.0",
 )
 
 app.add_middleware(
@@ -26,8 +35,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = Path("uploads")
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
 
 
 @app.get("/")
@@ -86,24 +100,29 @@ async def upload_document(file: UploadFile = File(...)):
 
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail="Could not read this PDF. Please try another file.",
-        )
+        ) from exc
 
     if not extracted_text:
         raise HTTPException(
             status_code=400,
-            detail="No readable text found. Scanned PDFs are not supported yet.",
+            detail=(
+                "No readable text found. "
+                "Scanned PDFs are not supported yet."
+            ),
         )
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
     document_id = str(uuid4())
     filename = Path(file.filename).name
 
     text_path = UPLOAD_DIR / f"{document_id}.txt"
     metadata_path = UPLOAD_DIR / f"{document_id}.meta"
+    pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
 
     metadata = {
         "filename": filename,
@@ -112,11 +131,37 @@ async def upload_document(file: UploadFile = File(...)):
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    text_path.write_text(extracted_text, encoding="utf-8")
-    metadata_path.write_text(
-        json.dumps(metadata, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    try:
+        pdf_path.write_bytes(content)
+        text_path.write_text(extracted_text, encoding="utf-8")
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        chunk_count = index_document(
+            document_id=document_id,
+            filename=filename,
+            text=extracted_text,
+        )
+
+    except Exception as exc:
+        pdf_path.unlink(missing_ok=True)
+        text_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+
+        try:
+            delete_document_vectors(document_id)
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not save and index the document. "
+                "Please try again."
+            ),
+        ) from exc
 
     return {
         "document_id": document_id,
@@ -124,7 +169,8 @@ async def upload_document(file: UploadFile = File(...)):
         "pages": len(reader.pages),
         "characters_extracted": len(extracted_text),
         "preview": extracted_text[:500],
-        "message": "PDF uploaded and text extracted successfully.",
+        "chunks_indexed": chunk_count,
+        "message": "PDF uploaded and indexed for semantic search.",
     }
 
 
@@ -152,14 +198,11 @@ def search_documents(q: str):
         metadata_path = UPLOAD_DIR / f"{text_path.stem}.meta"
 
         try:
-            metadata_content = metadata_path.read_text(encoding="utf-8")
-            try:
-                metadata = json.loads(metadata_content)
-                filename = metadata.get("filename", "Unknown document")
-            except json.JSONDecodeError:
-                # Support older metadata files containing only a filename.
-                filename = metadata_content.strip() or "Unknown document"
-        except OSError:
+            metadata = json.loads(
+                metadata_path.read_text(encoding="utf-8")
+            )
+            filename = metadata.get("filename", "Unknown document")
+        except (OSError, json.JSONDecodeError):
             filename = "Unknown document"
 
         paragraphs = [
@@ -188,6 +231,110 @@ def search_documents(q: str):
     }
 
 
+@app.get("/api/documents/semantic-search")
+def semantic_search(q: str, limit: int = 5):
+    query = q.strip()
+
+    if not query:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a search query.",
+        )
+
+    if limit < 1 or limit > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Limit must be between 1 and 10.",
+        )
+
+    try:
+        matches = search_similar_documents(query, limit=limit)
+
+        matches = [
+            match
+            for match in matches
+            if (
+                UPLOAD_DIR / f"{match['document_id']}.txt"
+            ).is_file()
+        ]
+
+        return {
+            "query": query,
+            "results": matches,
+            "total_results": len(matches),
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Semantic search failed. Check that the embedding "
+                "model is installed and the backend is running."
+            ),
+        ) from exc
+
+
+@app.post("/api/ask")
+def ask_silvera(request: AskRequest):
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a question.",
+        )
+
+    try:
+        matches = search_similar_documents(question, limit=5)
+
+        # Exclude passages whose original documents no longer exist.
+        matches = [
+            match
+            for match in matches
+            if (
+                UPLOAD_DIR / f"{match['document_id']}.txt"
+            ).is_file()
+        ]
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve relevant document passages.",
+        ) from exc
+
+    try:
+        answer = generate_answer(question, matches)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Silvera could not generate an answer. "
+                "Make sure Ollama is running and llama3.2:3b is installed."
+            ),
+        ) from exc
+
+    sources = [
+        {
+            "document_id": match.get("document_id"),
+            "filename": match.get("filename", "Unknown document"),
+            "passage": match.get("passage", ""),
+            "similarity": match.get("similarity"),
+            "chunk_index": match.get("chunk_index"),
+        }
+        for match in matches
+    ]
+
+    return {
+        "question": question,
+        "answer": answer,
+        "sources": sources,
+        "total_sources": len(sources),
+        "model": "llama3.2:3b",
+        "local": True,
+    }
+
+
 @app.get("/api/documents")
 def list_documents():
     if not UPLOAD_DIR.exists():
@@ -205,7 +352,6 @@ def list_documents():
             try:
                 metadata = json.loads(metadata_content)
             except json.JSONDecodeError:
-                # Support older metadata files containing only a filename.
                 metadata = {"filename": metadata_content.strip()}
 
             try:
@@ -240,14 +386,15 @@ def list_documents():
 def delete_document(document_id: str):
     try:
         document_id = str(UUID(document_id))
-    except ValueError:
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail="Invalid document ID.",
-        )
+        ) from exc
 
     text_path = UPLOAD_DIR / f"{document_id}.txt"
     metadata_path = UPLOAD_DIR / f"{document_id}.meta"
+    pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
 
     if not text_path.is_file():
         raise HTTPException(
@@ -256,9 +403,11 @@ def delete_document(document_id: str):
         )
 
     try:
-        # Remove metadata first. If that fails, the document remains searchable.
         metadata_path.unlink(missing_ok=True)
         text_path.unlink()
+        pdf_path.unlink(missing_ok=True)
+        delete_document_vectors(document_id)
+
     except OSError:
         raise HTTPException(
             status_code=500,
@@ -267,5 +416,52 @@ def delete_document(document_id: str):
 
     return {
         "document_id": document_id,
-        "message": "Document deleted successfully.",
+        "message": "Document and its search index deleted successfully.",
     }
+
+@app.get("/api/documents/{document_id}/original")
+def open_original_document(document_id: str):
+    try:
+        document_id = str(UUID(document_id))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID.",
+        )
+
+    pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
+    metadata_path = UPLOAD_DIR / f"{document_id}.meta"
+
+    if not pdf_path.is_file() or not metadata_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Original PDF not found. "
+                "Please upload the document again."
+            ),
+        )
+
+    try:
+        metadata = json.loads(
+            metadata_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read document metadata.",
+        )
+
+    filename = Path(
+        metadata.get("filename", "document.pdf")
+    ).name
+
+    if not filename.lower().endswith(".pdf"):
+        filename = "document.pdf"
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=filename,
+        content_disposition_type="inline",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )

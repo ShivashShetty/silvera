@@ -122,3 +122,88 @@ export async function deleteDocument(
     );
   }
 }
+
+export interface SemanticSearchResult {
+  document_id: string;
+  filename: string;
+  passage: string;
+  similarity: number;
+  chunk_index: number;
+}
+
+export interface SemanticSearchResponse {
+  query: string;
+  results: SemanticSearchResult[];
+  total_results: number;
+}
+
+export async function semanticSearchDocuments(
+  query: string,
+  limit: number = 5
+): Promise<SemanticSearchResponse> {
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(limit),
+  });
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/documents/semantic-search?${params.toString()}`
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      typeof result.detail === "string"
+        ? result.detail
+        : "Semantic search failed."
+    );
+  }
+
+  return result as SemanticSearchResponse;
+}
+
+
+export interface AskSource {
+  document_id: string;
+  filename: string;
+  passage: string;
+  similarity: number | null;
+  chunk_index: number | null;
+}
+
+export interface AskResponse {
+  question: string;
+  answer: string;
+  sources: AskSource[];
+  total_sources: number;
+  model: string;
+  local: boolean;
+}
+
+export async function askSilvera(
+  question: string
+): Promise<AskResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/ask`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ question }),
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      typeof result.detail === "string"
+        ? result.detail
+        : "Silvera could not generate an answer."
+    );
+  }
+
+  return result as AskResponse;
+}
+export function getOriginalDocumentUrl(documentId: string): string {
+  return `http://127.0.0.1:8000/api/documents/${encodeURIComponent(documentId)}/original`;
+}
