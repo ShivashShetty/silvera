@@ -365,3 +365,218 @@ footer {
     flex-direction: column;
   }
 }
+
+.upload-details {
+  margin-top: 14px;
+  overflow-wrap: anywhere;
+}
+
+.upload-details p,
+.upload-success p {
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 6px 0;
+}
+
+.upload-button {
+  margin-top: 10px;
+  padding: 10px 14px;
+  border: 1px solid #718ba9;
+  border-radius: 8px;
+  background: #24364b;
+  color: #f4f7fb;
+  cursor: pointer;
+}
+
+.upload-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.upload-error {
+  margin-top: 12px;
+  color: #e58c8c;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.upload-success {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(142, 188, 167, 0.3);
+  color: #a8d5bd;
+  overflow-wrap: anywhere;
+}
+
+.upload-success details {
+  margin-top: 10px;
+  color: #dce5ef;
+}
+
+.upload-success summary {
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.upload-success pre {
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 10px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.2);
+  color: #dce5ef;
+  font-size: 12px;
+}
+
+.feature-card button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.search-results {
+  width: 100%;
+  max-width: 760px;
+  margin: 24px auto 0;
+  padding: 20px;
+  border: 1px solid rgba(142, 164, 190, 0.25);
+  border-radius: 12px;
+  background: rgba(18, 29, 44, 0.65);
+  color: #dce5ef;
+  overflow-wrap: anywhere;
+}
+
+.search-results h3 {
+  margin: 0 0 10px;
+}
+
+.search-results > p {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.search-result {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid rgba(142, 164, 190, 0.2);
+  border-radius: 8px;
+}
+
+.search-result p {
+  margin: 0 0 10px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.search-result span {
+  color: #9cacc0;
+  font-size: 11px;
+}
+
+/* Documents page */
+.documents-page {
+  padding: 32px;
+  min-width: 0;
+}
+
+.documents-page h1 {
+  margin: 24px 0 8px;
+}
+
+.documents-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.document-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.document-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid rgba(142, 164, 190, 0.25);
+  border-radius: 12px;
+  background: rgba(18, 29, 44, 0.65);
+}
+
+.document-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  min-width: 0;
+}
+
+.document-info h3 {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+
+.document-info p {
+  margin: 4px 0;
+  color: #9cacc0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.delete-button {
+  flex-shrink: 0;
+  padding: 9px 14px;
+  border: 1px solid rgba(229, 140, 140, 0.5);
+  border-radius: 8px;
+  background: transparent;
+  color: #e58c8c;
+  cursor: pointer;
+}
+
+.delete-button:hover {
+  background: rgba(229, 140, 140, 0.1);
+}
+
+.delete-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.empty-documents {
+  margin-top: 24px;
+  padding: 32px;
+  text-align: center;
+  border: 1px dashed rgba(142, 164, 190, 0.3);
+  border-radius: 12px;
+}
+
+.empty-documents h3 {
+  margin: 14px 0 8px;
+}
+
+.empty-documents p {
+  color: #9cacc0;
+  font-size: 13px;
+}
+
+.nav-item {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+@media (max-width: 640px) {
+  .documents-page {
+    padding: 20px;
+  }
+
+  .document-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
