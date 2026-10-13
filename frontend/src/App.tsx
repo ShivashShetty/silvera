@@ -7,6 +7,10 @@ import {
   getDocuments,
   deleteDocument,
   getOriginalDocumentUrl,
+  getConversations,
+  getConversation,
+  deleteConversation,
+  type ConversationSummary,
   type DocumentUploadResult,
   type AskResponse,
   type AskSource,
@@ -44,6 +48,12 @@ function App() {
   const [question, setQuestion] = useState("");
   const [backendStatus, setBackendStatus] = useState("checking");
   const [activePage, setActivePage] = useState<Page>("intelligence");
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [openingConversationId, setOpeningConversationId] = useState<string | null>(null);
+  const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -68,6 +78,10 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    void loadConversationHistory();
+  }, []);
+
+  useEffect(() => {
     getSilveraStatus()
       .then(() => setBackendStatus("online"))
       .catch(() => setBackendStatus("offline"));
@@ -84,6 +98,79 @@ function App() {
 
     return () => window.removeEventListener("keydown", handleEscape);
   }, []);
+
+  async function loadConversationHistory() {
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      setConversations(await getConversations());
+    } catch (error) {
+      setHistoryError(
+        error instanceof Error ? error.message : "Could not load conversation history."
+      );
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function openConversation(conversationId: string) {
+    if (openingConversationId) return;
+    setOpeningConversationId(conversationId);
+    setHistoryError("");
+    try {
+      const conversation = await getConversation(conversationId);
+      const messages = conversation.messages ?? [];
+      const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
+      const lastAssistantMessage = [...messages].reverse().find((message) => message.role === "assistant");
+
+      setActiveConversationId(conversation.id);
+      setActivePage("intelligence");
+      setQuestion("");
+      setSearchError("");
+      setSearchResult(
+        lastAssistantMessage
+          ? {
+              conversation_id: conversation.id,
+              title: conversation.title,
+              question: lastUserMessage?.content ?? "",
+              answer: lastAssistantMessage.content,
+              sources: lastAssistantMessage.sources ?? [],
+              total_sources: (lastAssistantMessage.sources ?? []).length,
+              model: "llama3.2:3b",
+              local: true,
+            }
+          : null
+      );
+      setSelectedSource(null);
+    } catch (error) {
+      setHistoryError(
+        error instanceof Error ? error.message : "Could not open this conversation."
+      );
+    } finally {
+      setOpeningConversationId(null);
+    }
+  }
+
+  async function handleDeleteConversation(conversation: ConversationSummary) {
+    const confirmed = window.confirm(`Delete conversation "${conversation.title}"?`);
+    if (!confirmed || deletingConversationId) return;
+
+    setDeletingConversationId(conversation.id);
+    setHistoryError("");
+    try {
+      await deleteConversation(conversation.id);
+      setConversations((current) => current.filter((item) => item.id !== conversation.id));
+      if (activeConversationId === conversation.id) {
+        resetWorkspace();
+      }
+    } catch (error) {
+      setHistoryError(
+        error instanceof Error ? error.message : "Could not delete this conversation."
+      );
+    } finally {
+      setDeletingConversationId(null);
+    }
+  }
 
   async function loadDocuments() {
     setDocumentsLoading(true);
@@ -143,8 +230,10 @@ function App() {
     setSelectedSource(null);
 
     try {
-      const result = await askSilvera(query);
+      const result = await askSilvera(query, activeConversationId);
       setSearchResult(result);
+      setActiveConversationId(result.conversation_id);
+      await loadConversationHistory();
     } catch (error) {
       setSearchError(
         error instanceof Error
@@ -203,6 +292,7 @@ function App() {
   }
 
   function resetWorkspace() {
+    setActiveConversationId(null);
     setQuestion("");
     setSearchResult(null);
     setSearchError("");
@@ -261,6 +351,61 @@ function App() {
 
         <div className="nav-item">◈ &nbsp; Data sources</div>
         <div className="nav-item">◉ &nbsp; Activity logs</div>
+
+        <div className="history-heading">
+          <span>RECENT CONVERSATIONS</span>
+          <button
+            type="button"
+            className="history-refresh"
+            onClick={() => void loadConversationHistory()}
+            disabled={historyLoading}
+            aria-label="Refresh conversation history"
+            title="Refresh history"
+          >
+            ↻
+          </button>
+        </div>
+
+        <div className="conversation-list">
+          {historyLoading && conversations.length === 0 ? (
+            <p className="history-empty">Loading history...</p>
+          ) : conversations.length === 0 ? (
+            <p className="history-empty">Your conversations will appear here.</p>
+          ) : (
+            conversations.map((conversation) => (
+              <div
+                className={`conversation-item ${
+                  activeConversationId === conversation.id ? "active" : ""
+                }`}
+                key={conversation.id}
+              >
+                <button
+                  type="button"
+                  className="conversation-open"
+                  onClick={() => void openConversation(conversation.id)}
+                  disabled={openingConversationId !== null}
+                  title={conversation.title}
+                >
+                  <span className="conversation-title">{conversation.title}</span>
+                  <span className="conversation-meta">
+                    {conversation.message_count} messages
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="conversation-delete"
+                  onClick={() => void handleDeleteConversation(conversation)}
+                  disabled={deletingConversationId !== null}
+                  aria-label={`Delete conversation: ${conversation.title}`}
+                  title="Delete conversation"
+                >
+                  ×
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+        {historyError && <p className="history-error" role="alert">{historyError}</p>}
 
         <div className="sidebar-bottom">
           <div

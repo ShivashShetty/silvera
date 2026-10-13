@@ -9,6 +9,15 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+from services.chat_history import (
+    initialize_database,
+    create_conversation,
+    conversation_exists,
+    save_message,
+    list_conversations,
+    get_conversation,
+    delete_conversation,
+)
 
 from services.semantic_search import (
     index_document,
@@ -23,6 +32,10 @@ app = FastAPI(
     description="Secure Enterprise Intelligence",
     version="0.5.0",
 )
+
+@app.on_event("startup")
+def startup_event():
+    initialize_database()
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +55,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
+    conversation_id: str | None = None
 
 
 @app.get("/")
@@ -274,6 +288,7 @@ def semantic_search(q: str, limit: int = 5):
         ) from exc
 
 
+
 @app.post("/api/ask")
 def ask_silvera(request: AskRequest):
     question = request.question.strip()
@@ -284,10 +299,33 @@ def ask_silvera(request: AskRequest):
             detail="Please enter a question.",
         )
 
-    try:
-        matches = search_similar_documents(question, limit=5)
+    # Create a new conversation or continue an existing one.
+    conversation_id = request.conversation_id
 
-        # Exclude passages whose original documents no longer exist.
+    if conversation_id:
+        try:
+            conversation_id = str(UUID(conversation_id))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid conversation ID.",
+            ) from exc
+
+        if not conversation_exists(conversation_id):
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            )
+    else:
+        conversation_id = create_conversation(question)
+
+    try:
+        matches = search_similar_documents(
+            question,
+            limit=5,
+        )
+
+        # Ignore passages from documents that no longer exist.
         matches = [
             match
             for match in matches
@@ -325,7 +363,32 @@ def ask_silvera(request: AskRequest):
         for match in matches
     ]
 
+    # Save the question and answer with their source references.
+    try:
+        save_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=question,
+        )
+
+        save_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=answer,
+            sources=sources,
+        )
+
+        conversation = get_conversation(conversation_id)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the conversation history.",
+        ) from exc
+
     return {
+        "conversation_id": conversation_id,
+        "title": conversation["title"],
         "question": question,
         "answer": answer,
         "sources": sources,
@@ -465,3 +528,53 @@ def open_original_document(document_id: str):
         content_disposition_type="inline",
         headers={"X-Content-Type-Options": "nosniff"},
     )
+
+
+@app.get("/api/conversations")
+def api_list_conversations():
+    return {
+        "conversations": list_conversations(),
+    }
+
+
+@app.get("/api/conversations/{conversation_id}")
+def api_get_conversation(conversation_id: str):
+    try:
+        conversation_id = str(UUID(conversation_id))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid conversation ID.",
+        ) from exc
+
+    conversation = get_conversation(conversation_id)
+
+    if conversation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    return conversation
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def api_delete_conversation(conversation_id: str):
+    try:
+        conversation_id = str(UUID(conversation_id))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid conversation ID.",
+        ) from exc
+
+    if not delete_conversation(conversation_id):
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    return {
+        "conversation_id": conversation_id,
+        "message": "Conversation deleted successfully.",
+    }

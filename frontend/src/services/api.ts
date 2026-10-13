@@ -173,6 +173,8 @@ export interface AskSource {
 }
 
 export interface AskResponse {
+  conversation_id: string;
+  title: string;
   question: string;
   answer: string;
   sources: AskSource[];
@@ -181,15 +183,78 @@ export interface AskResponse {
   local: boolean;
 }
 
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface ConversationMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  sources: AskSource[];
+  created_at: string;
+}
+
+export interface ConversationDetail {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  messages: ConversationMessage[];
+}
+
+async function readApiError(response: Response, fallback: string): Promise<Error> {
+  const result = await response.json().catch(() => ({}));
+  return new Error(
+    typeof result.detail === "string" ? result.detail : fallback
+  );
+}
+
+export async function getConversations(): Promise<ConversationSummary[]> {
+  const response = await fetch(`${API_BASE_URL}/api/conversations`);
+  if (!response.ok) {
+    throw await readApiError(response, "Could not load conversation history.");
+  }
+  const data: { conversations: ConversationSummary[] } = await response.json();
+  return data.conversations;
+}
+
+export async function getConversation(
+  conversationId: string
+): Promise<ConversationDetail> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/conversations/${encodeURIComponent(conversationId)}`
+  );
+  if (!response.ok) {
+    throw await readApiError(response, "Could not open this conversation.");
+  }
+  return response.json() as Promise<ConversationDetail>;
+}
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/conversations/${encodeURIComponent(conversationId)}`,
+    { method: "DELETE" }
+  );
+  if (!response.ok) {
+    throw await readApiError(response, "Could not delete this conversation.");
+  }
+}
+
 export async function askSilvera(
-  question: string
+  question: string,
+  conversationId?: string | null
 ): Promise<AskResponse> {
   const response = await fetch(`${API_BASE_URL}/api/ask`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ question }),
+    body: JSON.stringify({ question, ...(conversationId ? { conversation_id: conversationId } : {}) }),
   });
 
   const result = await response.json();
