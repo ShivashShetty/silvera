@@ -20,7 +20,7 @@ from services.chat_history import (
 )
 
 from services.semantic_search import (
-    index_document,
+    index_document_pages,
     search_similar_documents,
     delete_document_vectors,
 )
@@ -108,8 +108,13 @@ async def upload_document(file: UploadFile = File(...)):
                 detail="Password-protected PDFs are not supported yet.",
             )
 
+        # Keep each page separate so retrieval can preserve original PDF page numbers.
+        page_texts = [
+            (page.extract_text() or "").strip()
+            for page in reader.pages
+        ]
         extracted_text = "\n".join(
-            page.extract_text() or "" for page in reader.pages
+            page_text for page_text in page_texts if page_text
         ).strip()
 
     except HTTPException:
@@ -137,6 +142,7 @@ async def upload_document(file: UploadFile = File(...)):
     text_path = UPLOAD_DIR / f"{document_id}.txt"
     metadata_path = UPLOAD_DIR / f"{document_id}.meta"
     pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
+    pages_path = UPLOAD_DIR / f"{document_id}.pages.json"
 
     metadata = {
         "filename": filename,
@@ -152,17 +158,22 @@ async def upload_document(file: UploadFile = File(...)):
             json.dumps(metadata, ensure_ascii=False),
             encoding="utf-8",
         )
+        pages_path.write_text(
+            json.dumps(page_texts, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-        chunk_count = index_document(
+        chunk_count = index_document_pages(
             document_id=document_id,
             filename=filename,
-            text=extracted_text,
+            pages=page_texts,
         )
 
     except Exception as exc:
         pdf_path.unlink(missing_ok=True)
         text_path.unlink(missing_ok=True)
         metadata_path.unlink(missing_ok=True)
+        pages_path.unlink(missing_ok=True)
 
         try:
             delete_document_vectors(document_id)
@@ -219,24 +230,41 @@ def search_documents(q: str):
         except (OSError, json.JSONDecodeError):
             filename = "Unknown document"
 
-        paragraphs = [
-            paragraph.strip()
-            for paragraph in text.splitlines()
-            if paragraph.strip()
-        ]
+        pages_path = UPLOAD_DIR / f"{text_path.stem}.pages.json"
+        try:
+            page_texts = json.loads(pages_path.read_text(encoding="utf-8"))
+            if not isinstance(page_texts, list):
+                page_texts = None
+        except (OSError, json.JSONDecodeError):
+            page_texts = None
 
-        matching = [
-            paragraph
-            for paragraph in paragraphs
-            if query in paragraph.lower()
-        ]
+        if page_texts is None:
+            # Legacy uploads did not preserve page boundaries.
+            searchable_pages = [(None, text)]
+        else:
+            searchable_pages = [
+                (page_number, page_text or "")
+                for page_number, page_text in enumerate(page_texts, start=1)
+            ]
 
-        for passage in matching:
-            results.append({
-                "document_id": text_path.stem,
-                "filename": filename,
-                "passage": passage,
-            })
+        for page_number, page_text in searchable_pages:
+            paragraphs = [
+                paragraph.strip()
+                for paragraph in page_text.splitlines()
+                if paragraph.strip()
+            ]
+            matching = [
+                paragraph
+                for paragraph in paragraphs
+                if query in paragraph.lower()
+            ]
+            for passage in matching:
+                results.append({
+                    "document_id": text_path.stem,
+                    "filename": filename,
+                    "passage": passage,
+                    "page_number": page_number,
+                })
 
     return {
         "query": q,
@@ -271,6 +299,29 @@ def semantic_search(q: str, limit: int = 5):
                 UPLOAD_DIR / f"{match['document_id']}.txt"
             ).is_file()
         ]
+
+        # Remove weakly related passages before sending evidence to the LLM
+        # and before displaying the source panel. Keep all strong matches,
+        # including matches from different documents.
+        if matches:
+            best_relevance = max(
+                float(match.get("relevance_score", 0) or 0)
+                for match in matches
+            )
+
+            # Apply relative filtering only when retrieval has a reasonably
+            # strong result. This avoids over-filtering broad/low-score queries.
+            if best_relevance >= 0.45:
+                relevance_floor = max(0.35, best_relevance * 0.70)
+                filtered_matches = [
+                    match
+                    for match in matches
+                    if float(match.get("relevance_score", 0) or 0)
+                    >= relevance_floor
+                ]
+
+                # Never discard every result; retain the best passage as fallback.
+                matches = filtered_matches or matches[:1]
 
         return {
             "query": query,
@@ -334,6 +385,29 @@ def ask_silvera(request: AskRequest):
             ).is_file()
         ]
 
+        # Remove weakly related passages before sending evidence to the LLM
+        # and before displaying the source panel. Keep all strong matches,
+        # including matches from different documents.
+        if matches:
+            best_relevance = max(
+                float(match.get("relevance_score", 0) or 0)
+                for match in matches
+            )
+
+            # Apply relative filtering only when retrieval has a reasonably
+            # strong result. This avoids over-filtering broad/low-score queries.
+            if best_relevance >= 0.45:
+                relevance_floor = max(0.35, best_relevance * 0.70)
+                filtered_matches = [
+                    match
+                    for match in matches
+                    if float(match.get("relevance_score", 0) or 0)
+                    >= relevance_floor
+                ]
+
+                # Never discard every result; retain the best passage as fallback.
+                matches = filtered_matches or matches[:1]
+
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -359,6 +433,7 @@ def ask_silvera(request: AskRequest):
             "passage": match.get("passage", ""),
             "similarity": match.get("similarity"),
             "chunk_index": match.get("chunk_index"),
+            "page_number": match.get("page_number"),
         }
         for match in matches
     ]
@@ -458,6 +533,7 @@ def delete_document(document_id: str):
     text_path = UPLOAD_DIR / f"{document_id}.txt"
     metadata_path = UPLOAD_DIR / f"{document_id}.meta"
     pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
+    pages_path = UPLOAD_DIR / f"{document_id}.pages.json"
 
     if not text_path.is_file():
         raise HTTPException(
@@ -467,6 +543,7 @@ def delete_document(document_id: str):
 
     try:
         metadata_path.unlink(missing_ok=True)
+        pages_path.unlink(missing_ok=True)
         text_path.unlink()
         pdf_path.unlink(missing_ok=True)
         delete_document_vectors(document_id)
@@ -528,6 +605,62 @@ def open_original_document(document_id: str):
         content_disposition_type="inline",
         headers={"X-Content-Type-Options": "nosniff"},
     )
+
+
+@app.get("/api/documents/{document_id}/pages/{page_number}")
+def get_document_page(document_id: str, page_number: int):
+    """Return extracted text for one original PDF page."""
+    try:
+        document_id = str(UUID(document_id))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID.",
+        ) from exc
+
+    if page_number < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Page number must be 1 or greater.",
+        )
+
+    pages_path = UPLOAD_DIR / f"{document_id}.pages.json"
+    metadata_path = UPLOAD_DIR / f"{document_id}.meta"
+
+    if not pages_path.is_file() or not metadata_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Page text not found for this document.",
+        )
+
+    try:
+        page_texts = json.loads(pages_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read the extracted page text.",
+        ) from exc
+
+    if not isinstance(page_texts, list):
+        raise HTTPException(
+            status_code=500,
+            detail="Stored page text has an invalid format.",
+        )
+
+    if page_number > len(page_texts):
+        raise HTTPException(
+            status_code=404,
+            detail="Page number is outside this document.",
+        )
+
+    return {
+        "document_id": document_id,
+        "filename": Path(metadata.get("filename", "document.pdf")).name,
+        "page_number": page_number,
+        "total_pages": len(page_texts),
+        "text": page_texts[page_number - 1] or "",
+    }
 
 
 @app.get("/api/conversations")

@@ -1,10 +1,15 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
+import { Document as PdfDocument, Page as PdfPage, pdfjs } from "react-pdf";
+import "react-pdf/dist/Page/AnnotationLayer.css";
+import "react-pdf/dist/Page/TextLayer.css";
 import {
   getSilveraStatus,
   uploadDocument,
@@ -23,35 +28,492 @@ import {
   type StoredDocument,
 } from "./services/api";
 import "./App.css";
+
+// Use the PDF.js worker bundled with the installed react-pdf dependency.
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url
+).toString();
+
 type Page = "intelligence" | "documents";
-function formatAnswerLine(line: string, index: number) {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return <div className="answer-spacer" key={index} />;
-  }
-  const bullet = trimmed.match(/^(?:[-*•]|\d+[.)])\s+(.+)$/);
-  if (bullet) {
-    return (
-      <div className="answer-list-item" key={index}>
-        <span className="answer-bullet">
-          {trimmed.match(/^\d+[.)]/)?.[0] ?? "•"}
-        </span>
-        <span>{bullet[1]}</span>
-      </div>
+function normalizeMarkdown(text: string) {
+  // Ollama sometimes escapes Markdown punctuation even when it intends
+  // to return Markdown. Normalize only common formatting characters.
+  return text.replace(/\\([|*`_])/g, "$1");
+}
+
+function findPassageRange(pageText: string, passage: string): [number, number] | null {
+  const normalizeWithPositions = (value: string) => {
+    let normalized = "";
+    const positions: number[] = [];
+    let previousWasWhitespace = false;
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value[index];
+      if (/\s/.test(character)) {
+        if (!previousWasWhitespace) {
+          normalized += " ";
+          positions.push(index);
+        }
+        previousWasWhitespace = true;
+      } else {
+        normalized += character.toLocaleLowerCase();
+        positions.push(index);
+        previousWasWhitespace = false;
+      }
+    }
+    while (normalized.startsWith(" ")) {
+      normalized = normalized.slice(1);
+      positions.shift();
+    }
+    while (normalized.endsWith(" ")) {
+      normalized = normalized.slice(0, -1);
+      positions.pop();
+    }
+    return { normalized, positions };
+  };
+
+  const page = normalizeWithPositions(pageText);
+  const target = normalizeWithPositions(passage.trim());
+  if (!target.normalized) return null;
+  const start = page.normalized.indexOf(target.normalized);
+  if (start < 0) return null;
+  const originalStart = page.positions[start];
+  const originalEnd = page.positions[start + target.normalized.length - 1] + 1;
+  return [originalStart, originalEnd];
+}
+
+function renderPageWithHighlight(pageText: string, passage: string): ReactNode {
+  const range = findPassageRange(pageText, passage);
+  if (!range) return pageText;
+  return (
+    <>
+      {pageText.slice(0, range[0])}
+      <mark
+        data-source-passage-highlight="true"
+        style={{
+          background: "rgba(105, 190, 169, 0.28)",
+          color: "#d9fff3",
+          border: "1px solid rgba(105, 190, 169, 0.55)",
+          borderRadius: "4px",
+          padding: "1px 2px",
+          boxShadow: "0 0 14px rgba(105, 190, 169, 0.12)",
+        }}
+      >
+        {pageText.slice(range[0], range[1])}
+      </mark>
+      {pageText.slice(range[1])}
+    </>
+  );
+}
+
+function renderInlineMarkdown(
+  text: string,
+  keyPrefix: string,
+  sources: AskSource[] = [],
+  onEvidenceClick?: (source: AskSource) => void
+): ReactNode {
+  const normalized = normalizeMarkdown(text);
+  const pattern = /(\[Evidence\s+\d+\]|\*\*[^*]+\*\*|__[^_]+__|`[^`]+`|\*[^*]+\*|_[^_]+_)/gi;
+  const parts = normalized.split(pattern);
+
+  return parts.map((part, index) => {
+    if (!part) return null;
+    const key = `${keyPrefix}-${index}`;
+
+    const evidenceMatch = part.match(/^\[Evidence\s+(\d+)\]$/i);
+    if (evidenceMatch) {
+      const source = sources[Number(evidenceMatch[1]) - 1];
+      return (
+        <button
+          key={key}
+          type="button"
+          onClick={() => source && onEvidenceClick?.(source)}
+          disabled={!source || !onEvidenceClick}
+          title={source ? `Open ${source.filename}` : "Source details unavailable"}
+          aria-label={source ? `Open source ${source.filename}` : part}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            verticalAlign: "baseline",
+            margin: "0 2px",
+            padding: "2px 7px",
+            borderRadius: "6px",
+            border: "1px solid rgba(105, 190, 169, 0.28)",
+            background: "rgba(105, 190, 169, 0.10)",
+            color: "#9bd6c5",
+            fontSize: "0.78em",
+            fontWeight: 650,
+            lineHeight: 1.5,
+            cursor: source && onEvidenceClick ? "pointer" : "default",
+          }}
+        >
+          {`Evidence ${evidenceMatch[1]}`}
+          <span aria-hidden="true" style={{ marginLeft: "4px", fontSize: "0.9em" }}>↗</span>
+        </button>
+      );
+    }
+
+    if (
+      (part.startsWith("**") && part.endsWith("**")) ||
+      (part.startsWith("__") && part.endsWith("__"))
+    ) {
+      return <strong key={key}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return <code key={key}>{part.slice(1, -1)}</code>;
+    }
+    if (
+      (part.startsWith("*") && part.endsWith("*")) ||
+      (part.startsWith("_") && part.endsWith("_"))
+    ) {
+      return <em key={key}>{part.slice(1, -1)}</em>;
+    }
+    return <Fragment key={key}>{part}</Fragment>;
+  });
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  const normalized = normalizeMarkdown(line.trim());
+  const withoutOuterPipes = normalized.replace(/^\|/, "").replace(/\|$/, "");
+  return withoutOuterPipes.split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableDivider(line: string): boolean {
+  const cells = splitMarkdownTableRow(line);
+  return (
+    cells.length > 0 &&
+    cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s/g, "")))
+  );
+}
+
+function renderAnswerContent(
+  text: string,
+  sources: AskSource[] = [],
+  onEvidenceClick?: (source: AskSource) => void
+) {
+  const lines = normalizeMarkdown(text).replace(/\r\n/g, "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const trimmed = lines[index].trim();
+
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+
+    // Render evidence references as compact citation cards instead of plain bullets.
+    if (/^(?:#{1,3}\s*)?(?:references|sources)\s*:?$/i.test(trimmed)) {
+      index += 1;
+      const references: string[] = [];
+      while (index < lines.length) {
+        const referenceLine = lines[index].trim();
+        if (!referenceLine) {
+          if (references.length > 0) {
+            index += 1;
+            break;
+          }
+          index += 1;
+          continue;
+        }
+        const bullet = referenceLine.match(/^(?:[-*•]|\d+[.)])\s+(.+)$/);
+        if (bullet) {
+          references.push(bullet[1]);
+          index += 1;
+          continue;
+        }
+        // Some model responses wrap a citation onto a second line.
+        if (references.length > 0 && !/^(?:#{1,3}\s|\|)/.test(referenceLine)) {
+          references[references.length - 1] += ` ${referenceLine}`;
+          index += 1;
+          continue;
+        }
+        break;
+      }
+
+      blocks.push(
+        <section
+          className="answer-reference-list"
+          key={`references-${index}`}
+          style={{
+            display: "grid",
+            gap: "9px",
+            margin: "12px 0 16px",
+          }}
+        >
+          {references.map((reference, referenceIndex) => {
+            const match = reference.match(/^\\[?Evidence\\s+(\\d+)\\]?\\s*(?:\\(PDF page\\s+\\d+\\))?\\s*:?\\s*(.*)$/i);
+            const evidenceNumber = match?.[1] ?? String(referenceIndex + 1);
+            const sourceIndex = Math.max(0, Number(evidenceNumber) - 1);
+            const source = sources[sourceIndex] as
+              | (AskSource & { page_number?: number | null })
+              | undefined;
+            // The page and filename come from backend source metadata, never model prose.
+            const metadataFilename = source?.filename?.trim();
+            const modelDescription = (match?.[2] || reference)
+              .replace(/\\s*\\(PDF page\\s+\\d+\\)/gi, "")
+              .trim();
+            const description = metadataFilename || modelDescription || "Source document";
+            const pageNumber = source?.page_number;
+            return (
+              <button
+                type="button"
+                className="answer-reference-card"
+                key={`reference-${referenceIndex}`}
+                onClick={() => source && onEvidenceClick?.(source)}
+                disabled={!source || !onEvidenceClick}
+                title={source ? `Open ${source.filename}` : "Source details unavailable"}
+                style={{
+                  width: "100%",
+                  textAlign: "left",
+                  color: "inherit",
+                  cursor: source && onEvidenceClick ? "pointer" : "default",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "12px",
+                  padding: "11px 13px",
+                  border: "1px solid rgba(126, 159, 166, 0.19)",
+                  borderRadius: "10px",
+                  background: "linear-gradient(110deg, rgba(19, 39, 43, 0.72), rgba(15, 22, 31, 0.92))",
+                  boxShadow: "inset 3px 0 0 rgba(105, 190, 169, 0.72)",
+                }}
+              >
+                <span
+                  aria-hidden="true"
+                  style={{
+                    display: "grid",
+                    placeItems: "center",
+                    flex: "0 0 34px",
+                    width: "34px",
+                    height: "34px",
+                    borderRadius: "9px",
+                    color: "#9bd6c5",
+                    background: "rgba(105, 190, 169, 0.12)",
+                    border: "1px solid rgba(105, 190, 169, 0.2)",
+                    fontSize: "15px",
+                  }}
+                >
+                  ▤
+                </span>
+                <span style={{ display: "grid", gap: "3px", minWidth: 0, flex: 1 }}>
+                  <span style={{ color: "#dce6e9", fontSize: "0.88em", lineHeight: 1.45, overflowWrap: "anywhere" }}>
+                    {metadataFilename || renderInlineMarkdown(description, `reference-description-${referenceIndex}`, sources, onEvidenceClick)}
+                  </span>
+                  <span style={{ color: "#82969e", fontSize: "0.72em", letterSpacing: "0.035em" }}>
+                    EVIDENCE {evidenceNumber}
+                  </span>
+                </span>
+                {pageNumber != null && (
+                  <span
+                    style={{
+                      flex: "0 0 auto",
+                      padding: "5px 8px",
+                      borderRadius: "6px",
+                      color: "#a9cfc6",
+                      background: "rgba(105, 190, 169, 0.09)",
+                      border: "1px solid rgba(105, 190, 169, 0.16)",
+                      fontSize: "0.72em",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    PAGE {pageNumber}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </section>
+      );
+      continue;
+    }
+
+    // Markdown table: a header row followed by a separator row.
+    if (
+      trimmed.includes("|") &&
+      index + 1 < lines.length &&
+      isMarkdownTableDivider(lines[index + 1])
+    ) {
+      const headers = splitMarkdownTableRow(lines[index]);
+      index += 2;
+      const rows: string[][] = [];
+
+      while (index < lines.length && lines[index].trim().includes("|")) {
+        const row = splitMarkdownTableRow(lines[index]);
+        if (row.length > 0) rows.push(row);
+        index += 1;
+      }
+
+      blocks.push(
+        <div
+          className="answer-table-wrap"
+          key={`table-${index}`}
+          style={{
+            width: "100%",
+            overflowX: "auto",
+            margin: "16px 0",
+            border: "1px solid rgba(133, 153, 176, 0.18)",
+            borderRadius: "11px",
+            background: "#0d131b",
+            boxShadow: "0 8px 24px rgba(0, 0, 0, 0.14)",
+          }}
+        >
+          <table
+            className="answer-table"
+            style={{
+              width: "100%",
+              minWidth: "520px",
+              borderCollapse: "separate",
+              borderSpacing: 0,
+              fontSize: "0.9em",
+              lineHeight: 1.55,
+              textAlign: "left",
+              color: "#d4dce6",
+            }}
+          >
+            <thead>
+              <tr>
+                {headers.map((header, headerIndex) => (
+                  <th
+                    key={`head-${headerIndex}`}
+                    style={{
+                      padding: "12px 14px",
+                      borderBottom: "1px solid rgba(133, 153, 176, 0.22)",
+                      borderRight: headerIndex < headers.length - 1
+                        ? "1px solid rgba(133, 153, 176, 0.14)"
+                        : "none",
+                      fontWeight: 650,
+                      fontSize: "0.82em",
+                      letterSpacing: "0.025em",
+                      color: "#9eafc2",
+                      background: "#18232f",
+                      whiteSpace: "normal",
+                    }}
+                  >
+                    {renderInlineMarkdown(header, `table-head-${index}-${headerIndex}`, sources, onEvidenceClick)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={`row-${rowIndex}`}>
+                  {headers.map((_, cellIndex) => (
+                    <td
+                      key={`cell-${rowIndex}-${cellIndex}`}
+                      style={{
+                        padding: "12px 14px",
+                        borderBottom: rowIndex < rows.length - 1
+                          ? "1px solid rgba(133, 153, 176, 0.13)"
+                          : "none",
+                        borderRight: cellIndex < headers.length - 1
+                          ? "1px solid rgba(133, 153, 176, 0.11)"
+                          : "none",
+                        verticalAlign: "top",
+                        background: rowIndex % 2 === 0 ? "#101821" : "#0d151e",
+                        color: cellIndex === 0 ? "#dce7ef" : "#c3ceda",
+                        fontWeight: cellIndex === 0 ? 600 : 400,
+                      }}
+                    >
+                      {renderInlineMarkdown(
+                        row[cellIndex] ?? "",
+                        `table-cell-${index}-${rowIndex}-${cellIndex}`
+                      )}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      continue;
+    }
+
+    // Headings.
+    const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      const content = renderInlineMarkdown(heading[2], `heading-${index}`, sources, onEvidenceClick);
+      blocks.push(
+        level === 1 ? <h3 key={index}>{content}</h3> :
+        level === 2 ? <h4 key={index}>{content}</h4> :
+        <h5 key={index}>{content}</h5>
+      );
+      index += 1;
+      continue;
+    }
+
+    // Consecutive bullet or numbered-list items.
+    const listMatch = trimmed.match(/^(?:[-*•]|\d+[.)])\s+(.+)$/);
+    if (listMatch) {
+      const items: { marker: string; content: string }[] = [];
+      while (index < lines.length) {
+        const match = lines[index].trim().match(/^(?:([-*•])|(\d+[.)]))\s+(.+)$/);
+        if (!match) break;
+        items.push({
+          marker: match[2] ?? "•",
+          content: match[3],
+        });
+        index += 1;
+      }
+
+      const ordered = /^\d/.test(items[0]?.marker ?? "");
+      const ListTag = ordered ? "ol" : "ul";
+      blocks.push(
+        <ListTag className="answer-markdown-list" key={`list-${index}`}>
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex}>
+              {renderInlineMarkdown(item.content, `list-${index}-${itemIndex}`, sources, onEvidenceClick)}
+            </li>
+          ))}
+        </ListTag>
+      );
+      continue;
+    }
+
+    // Join wrapped plain-text lines into a single paragraph.
+    const paragraphLines = [trimmed];
+    index += 1;
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^(#{1,3})\s+/.test(lines[index].trim()) &&
+      !/^(?:[-*•]|\d+[.)])\s+/.test(lines[index].trim()) &&
+      !(
+        lines[index].trim().includes("|") &&
+        index + 1 < lines.length &&
+        isMarkdownTableDivider(lines[index + 1])
+      )
+    ) {
+      paragraphLines.push(lines[index].trim());
+      index += 1;
+    }
+
+    blocks.push(
+      <p key={`paragraph-${index}`}>
+        {renderInlineMarkdown(paragraphLines.join(" "), `paragraph-${index}`, sources, onEvidenceClick)}
+      </p>
     );
   }
-  return <p key={index}>{trimmed}</p>;
+
+  return blocks;
 }
+
 /* --------------------------------------------------
    Animated answer
    The completion callback stops the three dots.
 \-------------------------------------------------- */
 function AnimatedAnswer({
   content,
+  sources,
+  onEvidenceClick,
   animate,
   onTypingComplete,
 }: {
   content: string;
+  sources: AskSource[];
+  onEvidenceClick: (source: AskSource) => void;
   animate: boolean;
   onTypingComplete: () => void;
 }) {
@@ -97,9 +559,7 @@ function AnimatedAnswer({
   const visibleText = content.slice(0, visibleLength);
   return (
     <div className={`answer-content ${animate ? "answer-animated" : ""}`}>
-      {visibleText.split("\n").map((line, index) =>
-        formatAnswerLine(line, index)
-      )}
+      {renderAnswerContent(visibleText, sources, onEvidenceClick)}
     </div>
   );
 }
@@ -132,6 +592,15 @@ function App() {
     useState<string | null>(null);
   const [selectedSource, setSelectedSource] =
     useState<AskSource | null>(null);
+  const [sourcePageCount, setSourcePageCount] = useState<number | null>(null);
+  const [sourcePageText, setSourcePageText] = useState("");
+  const [sourcePageLoading, setSourcePageLoading] = useState(false);
+  const [sourcePageError, setSourcePageError] = useState("");
+  const [pdfPageCount, setPdfPageCount] = useState<number | null>(null);
+  const [pdfLoading, setPdfLoading] = useState(true);
+  const [pdfError, setPdfError] = useState("");
+  const pdfViewerRef = useRef<HTMLDivElement>(null);
+  const sourceHighlightRef = useRef<HTMLDivElement>(null);
   const [documents, setDocuments] = useState<StoredDocument[]>([]);
   const [documentsLoading, setDocumentsLoading] = useState(false);
   const [documentsError, setDocumentsError] = useState("");
@@ -160,6 +629,219 @@ function App() {
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
   }, []);
+  useEffect(() => {
+    if (!selectedSource) {
+      setSourcePageCount(null);
+      return;
+    }
+    let cancelled = false;
+    getDocuments()
+      .then((items) => {
+        if (cancelled) return;
+        const document = items.find(
+          (item) => item.document_id === selectedSource.document_id
+        );
+        setSourcePageCount(
+          typeof document?.pages === "number" ? document.pages : null
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setSourcePageCount(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSource?.document_id]);
+  useEffect(() => {
+    setPdfLoading(Boolean(selectedSource));
+    setPdfError("");
+    setPdfPageCount(null);
+    if (!selectedSource) {
+      setSourcePageText("");
+      setSourcePageError("");
+      return;
+    }
+
+    const pageNumber =
+      (selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1;
+    const controller = new AbortController();
+    setSourcePageLoading(true);
+    setSourcePageError("");
+    setSourcePageText("");
+
+    fetch(
+      `http://127.0.0.1:8000/api/documents/${encodeURIComponent(selectedSource.document_id)}/pages/${pageNumber}`,
+      { signal: controller.signal }
+    )
+      .then(async (response) => {
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(
+            typeof result.detail === "string"
+              ? result.detail
+              : "Could not load the extracted page text."
+          );
+        }
+        return result as { text?: string };
+      })
+      .then((result) => setSourcePageText(result.text ?? ""))
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === "AbortError") return;
+        setSourcePageError(
+          error instanceof Error ? error.message : "Could not load the extracted page text."
+        );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setSourcePageLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [selectedSource?.document_id, (selectedSource as (AskSource & { page_number?: number | null }) | null)?.page_number]);
+
+  useEffect(() => {
+    if (!sourcePageText) return;
+    const timer = window.setTimeout(() => {
+      const highlightedPassage = sourceHighlightRef.current?.querySelector<HTMLElement>(
+        '[data-source-passage-highlight="true"]'
+      );
+      highlightedPassage?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [sourcePageText, selectedSource?.passage]);
+
+  // Draw highlight rectangles from the real PDF text geometry. CSS Custom
+  // Highlight can misalign across PDF.js transformed spans, so use Range rects.
+  useEffect(() => {
+    const viewer = pdfViewerRef.current;
+    if (!viewer || !selectedSource?.passage || pdfLoading) return;
+
+    let overlayElements: HTMLDivElement[] = [];
+    const timer = window.setTimeout(() => {
+      const pageElement = viewer.querySelector<HTMLElement>(".react-pdf__Page");
+      const textLayer = viewer.querySelector<HTMLElement>(".react-pdf__Page__textContent");
+      if (!pageElement || !textLayer) return;
+
+      const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+      const positions: Array<{ node: Text; offset: number }> = [];
+      let normalizedPage = "";
+      let previousWasWhitespace = true;
+      let current: Node | null;
+
+      while ((current = walker.nextNode())) {
+        const node = current as Text;
+        for (let offset = 0; offset < node.data.length; offset += 1) {
+          const character = node.data[offset];
+          if (/\s/.test(character)) {
+            if (!previousWasWhitespace) {
+              normalizedPage += " ";
+              positions.push({ node, offset });
+            }
+            previousWasWhitespace = true;
+          } else {
+            normalizedPage += character.toLocaleLowerCase();
+            positions.push({ node, offset });
+            previousWasWhitespace = false;
+          }
+        }
+      }
+
+      const normalized = (value: string) =>
+        value.toLocaleLowerCase().replace(/\s+/g, " ").trim();
+      normalizedPage = normalized(normalizedPage);
+      while (positions.length && /\s/.test(positions[0].node.data[positions[0].offset])) positions.shift();
+      while (positions.length && /\s/.test(positions[positions.length - 1].node.data[positions[positions.length - 1].offset])) positions.pop();
+
+      const passage = selectedSource.passage;
+      const candidates = passage
+        .split(/(?<=[.!?])\s+|\n+/)
+        .map(normalized)
+        .filter((part) => part.length >= 28)
+        .sort((a, b) => b.length - a.length);
+
+      let matchedText = "";
+      let matchAt = -1;
+      for (const candidate of candidates) {
+        const index = normalizedPage.indexOf(candidate);
+        if (index >= 0) {
+          matchedText = candidate;
+          matchAt = index;
+          break;
+        }
+      }
+
+      // If extraction punctuation/spacing differs, use a long distinctive
+      // sequence of words rather than highlighting a short generic phrase.
+      if (matchAt < 0) {
+        const words = normalized(passage).split(" ").filter(Boolean);
+        for (let size = Math.min(18, words.length); size >= 7 && matchAt < 0; size -= 1) {
+          for (let offset = 0; offset <= words.length - size; offset += 1) {
+            const candidate = words.slice(offset, offset + size).join(" ");
+            if (candidate.length < 35) continue;
+            const found = normalizedPage.indexOf(candidate);
+            if (found >= 0) {
+              matchedText = candidate;
+              matchAt = found;
+              break;
+            }
+          }
+        }
+      }
+
+      if (matchAt < 0 || !matchedText) return;
+      const startPosition = positions[matchAt];
+      const endPosition = positions[matchAt + matchedText.length - 1];
+      if (!startPosition || !endPosition) return;
+
+      const range = document.createRange();
+      range.setStart(startPosition.node, startPosition.offset);
+      range.setEnd(endPosition.node, endPosition.offset + 1);
+      const pageRect = pageElement.getBoundingClientRect();
+      const rects = Array.from(range.getClientRects()).filter(
+        (rect) => rect.width > 0 && rect.height > 0
+      );
+
+      // One overlay per rendered text line. Coordinates are relative to the
+      // PDF page itself, so the marks remain aligned at any scroll position.
+      for (const rect of rects) {
+        const overlay = document.createElement("div");
+        overlay.setAttribute("data-silvera-pdf-highlight", "true");
+        Object.assign(overlay.style, {
+          position: "absolute",
+          left: `${rect.left - pageRect.left}px`,
+          top: `${rect.top - pageRect.top}px`,
+          width: `${rect.width}px`,
+          height: `${rect.height}px`,
+          background: "rgba(105, 190, 169, 0.38)",
+          borderBottom: "2px solid rgba(65, 160, 137, 0.95)",
+          borderRadius: "2px",
+          pointerEvents: "none",
+          zIndex: "8",
+          boxSizing: "border-box",
+        });
+        pageElement.appendChild(overlay);
+        overlayElements.push(overlay);
+      }
+
+      const firstRect = rects[0];
+      if (firstRect) {
+        viewer.scrollTo({
+          top: viewer.scrollTop + firstRect.top - viewer.getBoundingClientRect().top - 90,
+          behavior: "smooth",
+        });
+      }
+    }, 450);
+
+    return () => {
+      window.clearTimeout(timer);
+      overlayElements.forEach((element) => element.remove());
+    };
+  }, [
+    selectedSource?.document_id,
+    (selectedSource as (AskSource & { page_number?: number | null }) | null)?.page_number,
+    selectedSource?.passage,
+    pdfLoading,
+  ]);
+
   // Scroll only the conversation panel to the latest submitted prompt.
   useLayoutEffect(() => {
     if (!pendingPromptRef.current) return;
@@ -730,6 +1412,8 @@ function App() {
                                 <AnimatedAnswer
                                   key={String(message.id)}
                                   content={message.content}
+                                  sources={message.sources ?? []}
+                                  onEvidenceClick={setSelectedSource}
                                   animate={isTyping}
                                   onTypingComplete={
                                     handleTypingComplete
@@ -785,6 +1469,9 @@ function App() {
                                               {source.filename}
                                             </span>
                                             <span className="source-chip-meta">
+                                              {(source as AskSource & { page_number?: number | null }).page_number != null
+                                                ? `Page ${(source as AskSource & { page_number?: number | null }).page_number} · `
+                                                : ""}
                                               {source.similarity != null
                                                 ? `${(
                                                     source.similarity * 100
@@ -1003,68 +1690,139 @@ function App() {
         </footer>
       </main>
       {selectedSource && (
-        <div
-          className="source-modal-backdrop"
-          onClick={() => setSelectedSource(null)}
-          role="presentation"
-        >
+        <div className="source-modal-backdrop" onClick={() => setSelectedSource(null)} role="presentation">
           <section
             className="source-modal"
             role="dialog"
             aria-modal="true"
             aria-labelledby="source-modal-title"
             onClick={(event) => event.stopPropagation()}
+            style={{ width: "min(1120px, calc(100vw - 40px))", maxWidth: "1120px", maxHeight: "90vh", display: "flex", flexDirection: "column", overflow: "hidden" }}
           >
             <div className="source-modal-header">
               <div className="source-modal-title-icon">▤</div>
               <div className="source-modal-heading">
-                <span className="answer-kicker">
-                  SOURCE DOCUMENT
-                </span>
+                <span className="answer-kicker">SOURCE DOCUMENT</span>
                 <h3 id="source-modal-title">Retrieved passage</h3>
               </div>
+              <button type="button" className="source-done-button" onClick={() => setSelectedSource(null)} aria-label="Close source viewer" style={{ marginLeft: "auto" }}>✕</button>
             </div>
+
             <div className="source-modal-file">
               <div className="source-modal-file-info">
-                <span className="source-modal-filename">
-                  {selectedSource.filename}
-                </span>
+                <span className="source-modal-filename">{selectedSource.filename}</span>
                 <span className="source-modal-subtitle">
-                  Retrieved from your local knowledge base
+                  PDF page {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
+                  {" · "}Retrieved from your local knowledge base
                 </span>
               </div>
             </div>
-            {selectedSource.similarity != null && (
-              <div className="source-relevance">
-                <span>Semantic similarity</span>
-                <span>
-                  {(selectedSource.similarity * 100).toFixed(1)}%
-                </span>
+
+            <style>{`
+              .silvera-pdf-document { display: flex; justify-content: center; min-width: 0; }
+              .silvera-pdf-document .react-pdf__Page { position: relative; margin: 0 auto 18px; background: #fff; box-shadow: 0 8px 28px rgba(0,0,0,.32); }
+              .silvera-pdf-document .react-pdf__Page__canvas { display: block; max-width: 100%; }
+              .silvera-pdf-document .react-pdf__Page__textContent { user-select: text; }
+              .silvera-pdf-document .react-pdf__Page__textContent span { cursor: text; }
+              @media (max-width: 760px) {
+                .source-modal > div[style*="grid-template-columns"] { grid-template-columns: minmax(0,1fr) !important; overflow-y: auto !important; }
+                .source-modal .silvera-pdf-viewer { min-height: 360px !important; }
+              }
+            `}</style>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(250px, 0.8fr) minmax(0, 1.7fr)", gap: "14px", minHeight: 0, flex: 1, padding: "14px 18px", overflow: "hidden" }}>
+              <aside style={{ minWidth: 0, overflowY: "auto", border: "1px solid rgba(105, 190, 169, 0.22)", borderRadius: "10px", background: "rgba(105, 190, 169, 0.055)", padding: "16px" }}>
+                <span className="answer-kicker">RETRIEVED PASSAGE</span>
+                <p className="passage-content" style={{ whiteSpace: "pre-wrap", lineHeight: 1.75, overflowWrap: "anywhere", marginTop: "12px" }}>
+                  {selectedSource.passage}
+                </p>
+                {selectedSource.similarity != null && (
+                  <div className="source-relevance">
+                    <span>Semantic similarity</span>
+                    <span>{(selectedSource.similarity * 100).toFixed(1)}%</span>
+                  </div>
+                )}
+                <p style={{ color: "#91a6ad", fontSize: "0.78em", marginTop: "14px" }}>
+                  Exact text passage retrieved for this answer. Inspect the PDF alongside it for original context.
+                </p>
+              </aside>
+
+              <div style={{ display: "flex", flexDirection: "column", minWidth: 0, minHeight: "420px", border: "1px solid rgba(133, 153, 176, 0.18)", borderRadius: "10px", overflow: "hidden", background: "#0b1118" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", padding: "9px 12px", borderBottom: "1px solid rgba(133, 153, 176, 0.16)", color: "#cbd6df", fontSize: "0.82em" }}>
+                  <span>ORIGINAL PDF DOCUMENT</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "9px" }}>
+                    <button
+                      type="button"
+                      className="source-done-button"
+                      disabled={((selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1) <= 1}
+                      onClick={() => {
+                        const currentPage = (selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1;
+                        setSelectedSource({ ...selectedSource, page_number: Math.max(1, currentPage - 1) } as AskSource);
+                      }}
+                    >←</button>
+                    <span>
+                      Page {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
+                      {sourcePageCount || pdfPageCount ? ` of ${sourcePageCount ?? pdfPageCount}` : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className="source-done-button"
+                      disabled={(sourcePageCount ?? pdfPageCount) != null && ((selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1) >= (sourcePageCount ?? pdfPageCount ?? 1)}
+                      onClick={() => {
+                        const currentPage = (selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1;
+                        setSelectedSource({ ...selectedSource, page_number: sourcePageCount ? Math.min(sourcePageCount, currentPage + 1) : currentPage + 1 } as AskSource);
+                      }}
+                    >→</button>
+                  </div>
+                </div>
+                <div
+                  ref={pdfViewerRef}
+                  className="silvera-pdf-viewer"
+                  style={{ flex: 1, minHeight: "420px", overflow: "auto", padding: "18px", background: "#202833" }}
+                >
+                  {pdfLoading && (
+                    <p style={{ color: "#b8c5d2", textAlign: "center", padding: "24px" }}>
+                      Loading original PDF...
+                    </p>
+                  )}
+                  {pdfError && (
+                    <p role="alert" style={{ color: "#e58c8c", padding: "18px" }}>
+                      {pdfError}
+                    </p>
+                  )}
+                  <PdfDocument
+                    key={selectedSource.document_id}
+                    file={getOriginalDocumentUrl(selectedSource.document_id)}
+                    onLoadSuccess={({ numPages }) => {
+                      setPdfPageCount(numPages);
+                      setPdfLoading(false);
+                      setPdfError("");
+                    }}
+                    onLoadError={(error) => {
+                      setPdfLoading(false);
+                      setPdfError(error instanceof Error ? error.message : "Could not render this PDF.");
+                    }}
+                    loading={null}
+                    error={null}
+                    className="silvera-pdf-document"
+                  >
+                    <PdfPage
+                      key={`${selectedSource.document_id}-${(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}`}
+                      pageNumber={(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
+                      renderTextLayer
+                      renderAnnotationLayer
+                      onRenderSuccess={() => setPdfLoading(false)}
+                      width={Math.max(280, Math.min(760, (typeof window !== "undefined" ? window.innerWidth : 1200) * 0.52))}
+                    />
+                  </PdfDocument>
+                </div>
               </div>
-            )}
-            <div className="source-modal-body">
-              <span className="answer-kicker">PASSAGE CONTENT</span>
-              <p className="passage-content">
-                {selectedSource.passage}
-              </p>
             </div>
+
             <div className="source-modal-footer">
               <span>◇ Stored and processed locally</span>
               <div className="source-modal-actions">
-                <button
-                  className="source-open-original"
-                  onClick={openOriginalDocument}
-                  type="button"
-                >
-                  Open original ↗
-                </button>
-                <button
-                  className="source-done-button"
-                  onClick={() => setSelectedSource(null)}
-                  type="button"
-                >
-                  Done
-                </button>
+                <button className="source-open-original" onClick={openOriginalDocument} type="button">Open original ↗</button>
+                <button className="source-done-button" onClick={() => setSelectedSource(null)} type="button">Done</button>
               </div>
             </div>
           </section>
