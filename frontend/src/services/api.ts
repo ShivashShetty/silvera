@@ -50,6 +50,20 @@ export async function uploadDocument(
   return result as DocumentUploadResult;
 }
 
+export async function uploadDocuments(
+  files: File[]
+): Promise<DocumentUploadResult[]> {
+  if (files.length === 0) {
+    return [];
+  }
+
+  const results: DocumentUploadResult[] = [];
+  for (const file of files) {
+    results.push(await uploadDocument(file));
+  }
+  return results;
+}
+
 export interface DocumentSearchResult {
   document_id: string;
   filename: string;
@@ -181,6 +195,15 @@ export interface AskResponse {
   total_sources: number;
   model: string;
   local: boolean;
+  structured_query?: StructuredQueryResult | null;
+}
+
+export interface StructuredQueryResult {
+  sql: string;
+  columns: string[];
+  rows: Array<Array<string | number | null>>;
+  truncated: boolean;
+  sources: string[];
 }
 
 export interface ConversationSummary {
@@ -247,14 +270,21 @@ export async function deleteConversation(conversationId: string): Promise<void> 
 
 export async function askSilvera(
   question: string,
-  conversationId?: string | null
+  conversationId?: string | null,
+  dataMode = false,
+  sql?: string
 ): Promise<AskResponse> {
   const response = await fetch(`${API_BASE_URL}/api/ask`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ question, ...(conversationId ? { conversation_id: conversationId } : {}) }),
+    body: JSON.stringify({
+      question,
+      ...(conversationId ? { conversation_id: conversationId } : {}),
+      ...(dataMode ? { data_mode: true } : {}),
+      ...(sql !== undefined ? { sql } : {}),
+    }),
   });
 
   const result = await response.json();

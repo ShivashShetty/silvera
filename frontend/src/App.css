@@ -315,6 +315,20 @@ h1 span {
 .search-box textarea::placeholder {
   color: #737b8d;
 }
+.sql-code-editor .cm-editor {
+  border-radius: 9px;
+  font-size: 0.9rem;
+}
+.sql-code-editor .cm-scroller {
+  font-family: Consolas, "Courier New", monospace;
+  line-height: 1.6;
+}
+.sql-code-editor .cm-content {
+  padding: 14px 0;
+}
+.sql-code-editor .cm-focused {
+  outline: none;
+}
 .search-footer {
   display: flex;
   align-items: center;

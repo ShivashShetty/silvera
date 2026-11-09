@@ -1,6 +1,7 @@
 
 import io
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -25,6 +26,14 @@ from services.semantic_search import (
     delete_document_vectors,
 )
 from services.local_ai import generate_answer
+from services.document_service import parse_uploaded_file
+from services.structured_data_service import (
+    StructuredQueryError,
+    delete_structured_document,
+    get_indexed_document_ids,
+    index_structured_document,
+    run_structured_query,
+)
 
 
 app = FastAPI(
@@ -51,11 +60,67 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 MAX_FILE_SIZE = 10 * 1024 * 1024
+SUPPORTED_EXTENSIONS = {
+    ".pdf",
+    ".docx",
+    ".docm",
+    ".xlsx",
+    ".xlsm",
+    ".pptx",
+    ".pptm",
+    ".csv",
+    ".tsv",
+    ".txt",
+    ".md",
+    ".html",
+    ".htm",
+    ".eml",
+    ".json",
+    ".xml",
+}
 
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
     conversation_id: str | None = None
+    data_mode: bool = False
+    sql: str | None = Field(default=None, max_length=10000)
+
+
+STRUCTURED_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".xlsm"}
+
+
+def sync_existing_structured_documents() -> None:
+    if not UPLOAD_DIR.exists():
+        return
+    indexed_ids = get_indexed_document_ids()
+    for metadata_path in UPLOAD_DIR.glob("*.meta"):
+        document_id = metadata_path.stem
+        if document_id in indexed_ids:
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        extension = str(metadata.get("original_extension") or "").lower()
+        if extension not in STRUCTURED_EXTENSIONS:
+            continue
+        original_path = UPLOAD_DIR / f"{document_id}{extension}"
+        if not original_path.is_file():
+            continue
+
+        extraction = parse_uploaded_file(
+            file_path=original_path,
+            filename=Path(metadata.get("filename") or original_path.name).name,
+            document_id=document_id,
+        )
+        index_structured_document(
+            document_id,
+            Path(metadata.get("filename") or original_path.name).name,
+            extraction.tables,
+        )
+        indexed_ids.add(document_id)
 
 
 @app.get("/")
@@ -79,10 +144,20 @@ def api_status():
 
 @app.post("/api/documents/upload")
 async def upload_document(file: UploadFile = File(...)):
-    if not file.filename or Path(file.filename).suffix.lower() != ".pdf":
+    if not file.filename:
         raise HTTPException(
             status_code=400,
-            detail="Please upload a PDF file.",
+            detail="A filename is required.",
+        )
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported file type. Silvera currently accepts PDF, DOCX, DOCM, "
+                "XLSX, XLSM, PPTX, PPTM, CSV, TSV, TXT, MD, HTML, HTM, EML, JSON, and XML."
+            ),
         )
 
     content = await file.read(MAX_FILE_SIZE + 1)
@@ -90,48 +165,13 @@ async def upload_document(file: UploadFile = File(...)):
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
-            detail="PDF must be smaller than 10 MB.",
+            detail="Files must be smaller than 10 MB.",
         )
 
-    if not content.startswith(b"%PDF-"):
+    if suffix == ".pdf" and not content.startswith(b"%PDF-"):
         raise HTTPException(
             status_code=400,
             detail="The uploaded file is not a valid PDF.",
-        )
-
-    try:
-        reader = PdfReader(io.BytesIO(content), strict=True)
-
-        if reader.is_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Password-protected PDFs are not supported yet.",
-            )
-
-        # Keep each page separate so retrieval can preserve original PDF page numbers.
-        page_texts = [
-            (page.extract_text() or "").strip()
-            for page in reader.pages
-        ]
-        extracted_text = "\n".join(
-            page_text for page_text in page_texts if page_text
-        ).strip()
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not read this PDF. Please try another file.",
-        ) from exc
-
-    if not extracted_text:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No readable text found. "
-                "Scanned PDFs are not supported yet."
-            ),
         )
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -139,20 +179,62 @@ async def upload_document(file: UploadFile = File(...)):
     document_id = str(uuid4())
     filename = Path(file.filename).name
 
+    try:
+        extraction = parse_uploaded_file(
+            file_bytes=content,
+            filename=filename,
+            document_id=document_id,
+            metadata={"original_content_type": file.content_type},
+        )
+    except Exception as exc:  # pragma: no cover - defensive API handling
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read this file. Please try another document.",
+        ) from exc
+
+    extracted_text = extraction.extracted_text.strip()
+    if suffix == ".pdf":
+        pdf_pages = extraction.metadata.get("page_texts") or []
+        page_texts = [
+            (page if isinstance(page, str) else "").strip()
+            for page in pdf_pages
+        ]
+    else:
+        section_texts = [
+            section.text.strip()
+            for section in extraction.sections
+            if section.text and section.text.strip()
+        ]
+        page_texts = [
+            text for text in section_texts or [extracted_text] if text
+        ]
+
+    if not extracted_text and not page_texts:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No readable text could be extracted from this file. "
+                "A different source or a scanned document may be needed."
+            ),
+        )
+
     text_path = UPLOAD_DIR / f"{document_id}.txt"
     metadata_path = UPLOAD_DIR / f"{document_id}.meta"
-    pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
+    original_path = UPLOAD_DIR / f"{document_id}{suffix}"
     pages_path = UPLOAD_DIR / f"{document_id}.pages.json"
 
     metadata = {
         "filename": filename,
-        "pages": len(reader.pages),
+        "file_type": extraction.file_type,
+        "pages": len(page_texts),
         "characters_extracted": len(extracted_text),
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "original_extension": suffix,
+        "warnings": extraction.warnings,
     }
 
     try:
-        pdf_path.write_bytes(content)
+        original_path.write_bytes(content)
         text_path.write_text(extracted_text, encoding="utf-8")
         metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False),
@@ -168,9 +250,15 @@ async def upload_document(file: UploadFile = File(...)):
             filename=filename,
             pages=page_texts,
         )
+        if suffix in STRUCTURED_EXTENSIONS:
+            index_structured_document(
+                document_id=document_id,
+                filename=filename,
+                tables=extraction.tables,
+            )
 
     except Exception as exc:
-        pdf_path.unlink(missing_ok=True)
+        original_path.unlink(missing_ok=True)
         text_path.unlink(missing_ok=True)
         metadata_path.unlink(missing_ok=True)
         pages_path.unlink(missing_ok=True)
@@ -179,7 +267,6 @@ async def upload_document(file: UploadFile = File(...)):
             delete_document_vectors(document_id)
         except Exception:
             pass
-
         raise HTTPException(
             status_code=500,
             detail=(
@@ -191,11 +278,11 @@ async def upload_document(file: UploadFile = File(...)):
     return {
         "document_id": document_id,
         "filename": filename,
-        "pages": len(reader.pages),
+        "pages": len(page_texts),
         "characters_extracted": len(extracted_text),
         "preview": extracted_text[:500],
         "chunks_indexed": chunk_count,
-        "message": "PDF uploaded and indexed for semantic search.",
+        "message": "Document uploaded and indexed for search.",
     }
 
 
@@ -370,61 +457,78 @@ def ask_silvera(request: AskRequest):
     else:
         conversation_id = create_conversation(question)
 
-    try:
-        matches = search_similar_documents(
-            question,
-            limit=5,
-        )
-
-        # Ignore passages from documents that no longer exist.
-        matches = [
-            match
-            for match in matches
-            if (
-                UPLOAD_DIR / f"{match['document_id']}.txt"
-            ).is_file()
-        ]
-
-        # Remove weakly related passages before sending evidence to the LLM
-        # and before displaying the source panel. Keep all strong matches,
-        # including matches from different documents.
-        if matches:
-            best_relevance = max(
-                float(match.get("relevance_score", 0) or 0)
-                for match in matches
+    if request.data_mode:
+        try:
+            sync_existing_structured_documents()
+            structured_query = run_structured_query(question, request.sql)
+            answer = structured_query["answer"]
+        except StructuredQueryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not query the uploaded spreadsheet data.",
+            ) from exc
+        matches = []
+    else:
+        structured_query = None
+        try:
+            matches = search_similar_documents(
+                question,
+                limit=5,
             )
 
-            # Apply relative filtering only when retrieval has a reasonably
-            # strong result. This avoids over-filtering broad/low-score queries.
-            if best_relevance >= 0.45:
-                relevance_floor = max(0.35, best_relevance * 0.70)
-                filtered_matches = [
-                    match
+            # Ignore passages from documents that no longer exist.
+            matches = [
+                match
+                for match in matches
+                if (
+                    UPLOAD_DIR / f"{match['document_id']}.txt"
+                ).is_file()
+            ]
+
+            # Remove weakly related passages before sending evidence to the LLM
+            # and before displaying the source panel. Keep all strong matches,
+            # including matches from different documents.
+            if matches:
+                best_relevance = max(
+                    float(match.get("relevance_score", 0) or 0)
                     for match in matches
-                    if float(match.get("relevance_score", 0) or 0)
-                    >= relevance_floor
-                ]
+                )
 
-                # Never discard every result; retain the best passage as fallback.
-                matches = filtered_matches or matches[:1]
+                # Apply relative filtering only when retrieval has a reasonably
+                # strong result. This avoids over-filtering broad/low-score queries.
+                if best_relevance >= 0.45:
+                    relevance_floor = max(0.35, best_relevance * 0.70)
+                    filtered_matches = [
+                        match
+                        for match in matches
+                        if float(match.get("relevance_score", 0) or 0)
+                        >= relevance_floor
+                    ]
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not retrieve relevant document passages.",
-        ) from exc
+                    # Never discard every result; retain the best passage as fallback.
+                    matches = filtered_matches or matches[:1]
 
-    try:
-        answer = generate_answer(question, matches)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not retrieve relevant document passages.",
+            ) from exc
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Silvera could not generate an answer. "
-                "Make sure Ollama is running and llama3.2:3b is installed."
-            ),
-        ) from exc
+        try:
+            answer = generate_answer(question, matches)
+
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Silvera could not generate an answer. "
+                    "Make sure Ollama is running and llama3.2:3b is installed."
+                ),
+            ) from exc
 
     sources = [
         {
@@ -470,6 +574,7 @@ def ask_silvera(request: AskRequest):
         "total_sources": len(sources),
         "model": "llama3.2:3b",
         "local": True,
+        "structured_query": structured_query,
     }
 
 
@@ -502,6 +607,7 @@ def list_documents():
             documents.append({
                 "document_id": document_id,
                 "filename": metadata.get("filename") or "Unknown document",
+                "file_type": metadata.get("file_type"),
                 "pages": metadata.get("pages"),
                 "characters_extracted": metadata.get(
                     "characters_extracted", character_count
@@ -532,23 +638,33 @@ def delete_document(document_id: str):
 
     text_path = UPLOAD_DIR / f"{document_id}.txt"
     metadata_path = UPLOAD_DIR / f"{document_id}.meta"
-    pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
     pages_path = UPLOAD_DIR / f"{document_id}.pages.json"
 
-    if not text_path.is_file():
+    if not text_path.is_file() and not metadata_path.is_file():
         raise HTTPException(
             status_code=404,
             detail="Document not found.",
         )
 
     try:
+        metadata = {}
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                metadata = {}
+
+        original_extension = metadata.get("original_extension") or ".pdf"
+        original_path = UPLOAD_DIR / f"{document_id}{original_extension}"
+
         metadata_path.unlink(missing_ok=True)
         pages_path.unlink(missing_ok=True)
-        text_path.unlink()
-        pdf_path.unlink(missing_ok=True)
+        text_path.unlink(missing_ok=True)
+        original_path.unlink(missing_ok=True)
         delete_document_vectors(document_id)
+        delete_structured_document(document_id)
 
-    except OSError:
+    except (OSError, sqlite3.Error):
         raise HTTPException(
             status_code=500,
             detail="Could not delete the document. Please try again.",
@@ -569,14 +685,12 @@ def open_original_document(document_id: str):
             detail="Invalid document ID.",
         )
 
-    pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
     metadata_path = UPLOAD_DIR / f"{document_id}.meta"
-
-    if not pdf_path.is_file() or not metadata_path.is_file():
+    if not metadata_path.is_file():
         raise HTTPException(
             status_code=404,
             detail=(
-                "Original PDF not found. "
+                "Original document not found. "
                 "Please upload the document again."
             ),
         )
@@ -591,25 +705,48 @@ def open_original_document(document_id: str):
             detail="Could not read document metadata.",
         )
 
-    filename = Path(
-        metadata.get("filename", "document.pdf")
-    ).name
+    original_extension = metadata.get("original_extension") or ".pdf"
+    original_path = UPLOAD_DIR / f"{document_id}{original_extension}"
 
-    if not filename.lower().endswith(".pdf"):
-        filename = "document.pdf"
+    if not original_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Original document file is missing.",
+        )
+
+    filename = Path(metadata.get("filename", "document")).name
+    extension = original_extension.lower()
+    media_types = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".docm": "application/vnd.ms-word.document.macroEnabled.12",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".pptm": "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+        ".csv": "text/csv",
+        ".tsv": "text/tab-separated-values",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".eml": "message/rfc822",
+        ".json": "application/json",
+        ".xml": "application/xml",
+    }
 
     return FileResponse(
-        path=pdf_path,
-        media_type="application/pdf",
+        path=original_path,
+        media_type=media_types.get(extension, "application/octet-stream"),
         filename=filename,
-        content_disposition_type="inline",
+        content_disposition_type="inline" if extension == ".pdf" else "attachment",
         headers={"X-Content-Type-Options": "nosniff"},
     )
 
 
 @app.get("/api/documents/{document_id}/pages/{page_number}")
 def get_document_page(document_id: str, page_number: int):
-    """Return extracted text for one original PDF page."""
+    """Return extracted text for one indexed document page or section."""
     try:
         document_id = str(UUID(document_id))
     except ValueError as exc:
