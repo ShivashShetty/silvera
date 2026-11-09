@@ -1,9 +1,230 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 from uuid import uuid4
+
+from services import structured_data_service as service
+
+
+class ReadOnlySqlTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database = Path(self.temporary.name) / "data.db"
+        with closing(sqlite3.connect(self.database)) as connection:
+            with connection:
+                connection.execute(
+                    'CREATE TABLE "allowed_table" ("public_col" TEXT, "secret_col" TEXT)'
+                )
+                connection.execute(
+                    'INSERT INTO "allowed_table" VALUES ("visible", "private")'
+                )
+                connection.execute('CREATE TABLE "other_table" ("other_col" TEXT)')
+                connection.execute('INSERT INTO "other_table" VALUES ("hidden")')
+        self.database_patcher = patch.object(service, "DATABASE_PATH", self.database)
+        self.database_patcher.start()
+        self.columns = {"public_col"}
+
+    def tearDown(self):
+        self.database_patcher.stop()
+        self.temporary.cleanup()
+
+    def test_sql_generation_prompt_uses_exact_schema_and_repair_error(self):
+        response_body = json.dumps(
+            {"message": {"content": json.dumps({"sql": "SELECT public_col FROM allowed_table"})}}
+        ).encode()
+        with patch(
+            "services.structured_data_service.urlopen",
+            return_value=unittest.mock.mock_open(read_data=response_body)(),
+        ) as open_url:
+            statement = service.generate_sql(
+                "show public values",
+                "allowed_table",
+                ["public_col"],
+                previous_sql="SELECT missing_col FROM allowed_table",
+                error="SQLite rejected the query: no such column: missing_col",
+            )
+
+        self.assertEqual(statement, "SELECT public_col FROM allowed_table")
+        payload = json.loads(open_url.call_args.args[0].data)
+        prompt = payload["messages"][1]["content"]
+        self.assertIn('Allowed columns (JSON): ["public_col"]', prompt)
+        self.assertIn("Previous SQL: SELECT missing_col FROM allowed_table", prompt)
+        self.assertIn("no such column: missing_col", prompt)
+        self.assertIn("COLLATE NOCASE", prompt)
+        self.assertIn("never invent or assume columns", payload["messages"][0]["content"])
+
+    def test_friendly_sql_table_name_uses_filename_and_non_default_sheet(self):
+        self.assertEqual(
+            service.friendly_sql_table_name(
+                "Sales_Transactions_FY2025.csv",
+                "Table 1",
+            ),
+            "Sales_Transactions_FY2025",
+        )
+        self.assertEqual(
+            service.friendly_sql_table_name("Quarterly Sales.xlsx", "North America"),
+            "Quarterly_Sales_North_America",
+        )
+
+    def test_allowed_select_and_aggregate_work(self):
+        selected = service.execute_readonly_query(
+            "allowed_table",
+            self.columns,
+            "SELECT public_col AS label FROM allowed_table",
+        )
+        self.assertEqual(selected["columns"], ["label"])
+        self.assertEqual(selected["rows"], [["visible"]])
+        aggregate = service.execute_readonly_query(
+            "allowed_table",
+            self.columns,
+            "SELECT COUNT(*) AS row_count FROM allowed_table",
+        )
+        self.assertEqual(aggregate["rows"], [[1]])
+
+    def test_readable_table_alias_preserves_column_authorization(self):
+        selected = service.execute_readonly_query(
+            "allowed_table",
+            self.columns,
+            'SELECT "public_col" FROM "Employee Directory"',
+            table_alias="Employee Directory",
+        )
+        self.assertEqual(selected["rows"], [["visible"]])
+        with self.assertRaises(service.UnsafeQueryError):
+            service.execute_readonly_query(
+                "allowed_table",
+                self.columns,
+                'SELECT secret_col FROM "Employee Directory"',
+                table_alias="Employee Directory",
+            )
+        star = service.execute_readonly_query(
+            "allowed_table",
+            self.columns,
+            'SELECT * FROM "Employee Directory"',
+            table_alias="Employee Directory",
+        )
+        self.assertEqual(star["columns"], ["public_col"])
+        self.assertEqual(star["rows"], [["visible"]])
+
+    def test_nocase_text_filter_matches_csv_status_casing(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            with connection:
+                connection.execute(
+                    'UPDATE "allowed_table" SET "public_col" = "Completed"'
+                )
+        result = service.execute_readonly_query(
+            "allowed_table",
+            self.columns,
+            "SELECT public_col FROM allowed_table "
+            "WHERE public_col = 'completed' COLLATE NOCASE",
+        )
+        self.assertEqual(result["rows"], [["Completed"]])
+
+    def test_preview_selects_only_approved_columns_and_limits_rows(self):
+        preview = service.preview_dataset_rows(
+            "allowed_table",
+            self.columns,
+            limit=1,
+            offset=0,
+        )
+        self.assertEqual(preview["columns"], ["public_col"])
+        self.assertEqual(preview["rows"], [["visible"]])
+
+    def test_preview_rejects_out_of_range_pagination(self):
+        for limit, offset in ((0, 0), (101, 0), (10, -1)):
+            with self.subTest(limit=limit, offset=offset):
+                with self.assertRaises(ValueError):
+                    service.preview_dataset_rows(
+                        "allowed_table",
+                        self.columns,
+                        limit=limit,
+                        offset=offset,
+                    )
+
+    def test_writes_ddl_pragmas_multiple_statements_and_cte_values_are_rejected(self):
+        statements = (
+            "UPDATE allowed_table SET public_col='bad'",
+            "DELETE FROM allowed_table",
+            "DROP TABLE allowed_table",
+            "PRAGMA table_info(allowed_table)",
+            "SELECT public_col FROM allowed_table; SELECT 1",
+            "VALUES (1)",
+        )
+        for statement in statements:
+            with self.subTest(statement=statement):
+                with self.assertRaises(service.UnsafeQueryError):
+                    service.execute_readonly_query(
+                        "allowed_table",
+                        self.columns,
+                        statement,
+                    )
+
+    def test_unapproved_table_or_column_is_rejected(self):
+        for statement in (
+            "SELECT secret_col FROM allowed_table",
+            "SELECT other_col FROM other_table",
+            "SELECT * FROM allowed_table",
+        ):
+            with self.subTest(statement=statement):
+                with self.assertRaises(service.UnsafeQueryError):
+                    service.execute_readonly_query(
+                        "allowed_table",
+                        self.columns,
+                        statement,
+                    )
+
+    def test_sqlite_syntax_errors_include_a_fixable_diagnostic(self):
+        with self.assertRaisesRegex(
+            service.UnsafeQueryError,
+            'SQLite rejected the query: near "FROM": syntax error',
+        ):
+            service.execute_readonly_query(
+                "allowed_table",
+                self.columns,
+                "SELECT FROM allowed_table",
+            )
+
+        with self.assertRaisesRegex(
+            service.UnsafeQueryError,
+            "SQLite rejected the query: no such column: missing_col",
+        ):
+            service.execute_readonly_query(
+                "allowed_table",
+                self.columns,
+                "SELECT missing_col FROM allowed_table",
+            )
+
+    def test_query_timeout_and_row_limit(self):
+        with patch.object(service, "QUERY_TIMEOUT_SECONDS", 0.01):
+            with self.assertRaises(TimeoutError):
+                service.execute_readonly_query(
+                    "allowed_table",
+                    self.columns,
+                    """
+                    WITH RECURSIVE n(x) AS (
+                        SELECT 1 UNION ALL SELECT x+1 FROM n
+                    )
+                    SELECT max(x) FROM n
+                    """,
+                )
+
+        with patch.object(service, "MAX_ROWS", 1):
+            with closing(sqlite3.connect(self.database)) as connection:
+                with connection:
+                    connection.executemany(
+                        'INSERT INTO "allowed_table" VALUES (?, ?)',
+                        [("second", "s"), ("third", "t")],
+                    )
+            result = service.execute_readonly_query(
+                "allowed_table",
+                self.columns,
+                "SELECT public_col FROM allowed_table",
+            )
+            self.assertEqual(len(result["rows"]), 1)
+            self.assertTrue(result["truncated"])
 
 from services import structured_data_service as structured
 

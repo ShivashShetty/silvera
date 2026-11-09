@@ -18,3 +18,4 @@ uploads/
 .vscode/
 .DS_Store
 Thumbs.db
+backend/chroma_db/

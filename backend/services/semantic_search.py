@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+from collections.abc import Callable
 
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -9,6 +10,7 @@ from sentence_transformers import SentenceTransformer
 BASE_DIR = Path(__file__).resolve().parent.parent
 CHROMA_DIR = BASE_DIR / "chroma_db"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+INDEX_BATCH_SIZE = 128
 
 _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
 _collection = _client.get_or_create_collection(
@@ -63,43 +65,50 @@ def _store_document_chunks(
     document_id: str,
     filename: str,
     chunk_records: list[tuple[str, int | None]],
+    progress_callback: Callable[[int, int], None] | None = None,
 ):
     """Embed and store chunk text with optional original PDF page metadata."""
     _collection.delete(where={"document_id": document_id})
 
     if not chunk_records:
+        if progress_callback:
+            progress_callback(0, 0)
         return 0
 
-    chunk_texts = [record[0] for record in chunk_records]
-    embeddings = get_model().encode(
-        chunk_texts,
-        normalize_embeddings=True,
-    ).tolist()
+    model = get_model()
+    total_batches = (len(chunk_records) + INDEX_BATCH_SIZE - 1) // INDEX_BATCH_SIZE
+    if progress_callback:
+        progress_callback(0, total_batches)
+    for start in range(0, len(chunk_records), INDEX_BATCH_SIZE):
+        batch = chunk_records[start : start + INDEX_BATCH_SIZE]
+        chunk_texts = [record[0] for record in batch]
+        embeddings = model.encode(
+            chunk_texts,
+            normalize_embeddings=True,
+        ).tolist()
+        metadatas = []
+        for index, (_, page_number) in enumerate(batch, start=start):
+            metadata = {
+                "document_id": document_id,
+                "filename": filename,
+                "chunk_index": index,
+            }
+            if page_number is not None:
+                metadata["page_number"] = int(page_number)
+            metadatas.append(metadata)
 
-    ids = [
-        f"{document_id}_{index}"
-        for index in range(len(chunk_records))
-    ]
-
-    metadatas = []
-    for index, (_, page_number) in enumerate(chunk_records):
-        metadata = {
-            "document_id": document_id,
-            "filename": filename,
-            "chunk_index": index,
-        }
-        # ChromaDB metadata values cannot be None. Old/legacy indexing
-        # intentionally omits page_number rather than inventing one.
-        if page_number is not None:
-            metadata["page_number"] = int(page_number)
-        metadatas.append(metadata)
-
-    _collection.add(
-        ids=ids,
-        documents=chunk_texts,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
+        _collection.add(
+            ids=[
+                f"{document_id}_{index}"
+                for index in range(start, start + len(batch))
+            ],
+            documents=chunk_texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+        if progress_callback:
+            completed_batches = (start // INDEX_BATCH_SIZE) + 1
+            progress_callback(completed_batches, total_batches)
 
     return len(chunk_records)
 
@@ -119,6 +128,7 @@ def index_document_pages(
     document_id: str,
     filename: str,
     pages: list[str],
+    progress_callback: Callable[[int, int], None] | None = None,
 ):
     """
     Index PDF text page by page, preserving 1-based original PDF page numbers.
@@ -130,7 +140,12 @@ def index_document_pages(
         for chunk in split_into_chunks(page_text or ""):
             chunk_records.append((chunk, page_number))
 
-    return _store_document_chunks(document_id, filename, chunk_records)
+    return _store_document_chunks(
+        document_id,
+        filename,
+        chunk_records,
+        progress_callback,
+    )
 
 
 def _query_terms(query: str) -> list[str]:
@@ -161,7 +176,11 @@ def _passages_overlap(text_a: str, text_b: str) -> bool:
     return similarity >= 0.85
 
 
-def search_similar_documents(query: str, limit: int = 5):
+def search_similar_documents(
+    query: str,
+    limit: int = 5,
+    document_ids: list[str] | None = None,
+):
     """
     Hybrid retrieval using semantic similarity and keyword matching.
     Results preserve the existing API fields and add page_number when known.
@@ -170,7 +189,14 @@ def search_similar_documents(query: str, limit: int = 5):
     if not query or limit <= 0:
         return []
 
-    total = _collection.count()
+    if document_ids is not None and not document_ids:
+        return []
+    where = (
+        {"document_id": {"$in": document_ids}}
+        if document_ids is not None
+        else None
+    )
+    total = _collection.count(where=where) if where else _collection.count()
     if total == 0:
         return []
 
@@ -184,10 +210,15 @@ def search_similar_documents(query: str, limit: int = 5):
         normalize_embeddings=True,
     ).tolist()
 
+    query_options = {
+        "query_embeddings": query_embedding,
+        "n_results": min(max(limit * 4, 20), total),
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        query_options["where"] = where
     semantic_results = _collection.query(
-        query_embeddings=query_embedding,
-        n_results=min(max(limit * 4, 20), total),
-        include=["documents", "metadatas", "distances"],
+        **query_options,
     )
 
     semantic_docs = semantic_results.get("documents", [[]])[0]
@@ -216,9 +247,10 @@ def search_similar_documents(query: str, limit: int = 5):
         }
 
     # Keyword retrieval scans stored chunks to recover exact-term matches.
-    all_chunks = _collection.get(
-        include=["documents", "metadatas"],
-    )
+    get_options = {"include": ["documents", "metadatas"]}
+    if where:
+        get_options["where"] = where
+    all_chunks = _collection.get(**get_options)
 
     all_ids = all_chunks.get("ids", [])
     all_docs = all_chunks.get("documents", [])

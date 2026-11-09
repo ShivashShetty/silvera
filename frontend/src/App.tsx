@@ -14,11 +14,20 @@ import { Document as PdfDocument, Page as PdfPage, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import {
+  createInitialAdmin,
+  changePassword,
+  getAuthSetupStatus,
+  getCurrentUser,
   getSilveraStatus,
+  login as loginUser,
+  logout as logoutUser,
+  setCsrfToken,
   uploadDocument,
   askSilvera,
   getDocuments,
   deleteDocument,
+  getDocumentPage,
+  getDocumentDownloadUrl,
   getOriginalDocumentUrl,
   getConversations,
   getConversation,
@@ -30,7 +39,10 @@ import {
   type AskSource,
   type StructuredQueryResult,
   type StoredDocument,
+  type AuthUser,
 } from "./services/api";
+import SecurityWorkspace from "./SecurityWorkspace";
+import DataWorkspace from "./DataWorkspace";
 import "./App.css";
 
 // Use the PDF.js worker bundled with the installed react-pdf dependency.
@@ -39,7 +51,14 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url
 ).toString();
 
-type Page = "intelligence" | "documents";
+type Page = "intelligence" | "documents" | "security" | "data";
+function getDocumentSectionLabel(filename: string): string {
+  const extension = filename.split(".").pop()?.toLowerCase();
+  if (extension === "pptm" || extension === "pptx") return "Slide";
+  if (extension === "xlsm" || extension === "xlsx") return "Sheet";
+  return "Section";
+}
+
 function normalizeMarkdown(text: string) {
   // Ollama sometimes escapes Markdown punctuation even when it intends
   // to return Markdown. Normalize only common formatting characters.
@@ -579,10 +598,20 @@ function AnimatedAnswer({
   );
 }
 function App() {
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [authName, setAuthName] = useState("");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [question, setQuestion] = useState("");
   const [conversationMessages, setConversationMessages] =
     useState<ConversationMessage[]>([]);
   const [backendStatus, setBackendStatus] = useState("checking");
+  const [maxUploadMb, setMaxUploadMb] = useState(100);
   const [activePage, setActivePage] = useState<Page>("intelligence");
   const [dataMode, setDataMode] = useState(false);
   const [conversations, setConversations] =
@@ -598,8 +627,7 @@ function App() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
-  const [uploadResults, setUploadResults] =
-    useState<DocumentUploadResult[]>([]);
+  const [uploadResults, setUploadResults] = useState<DocumentUploadResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [searchResult, setSearchResult] =
@@ -621,10 +649,14 @@ function App() {
   const [pdfError, setPdfError] = useState("");
   const pdfViewerRef = useRef<HTMLDivElement>(null);
   const sourceHighlightRef = useRef<HTMLDivElement>(null);
+  const userMenuRef = useRef<HTMLDivElement>(null);
   const [documents, setDocuments] = useState<StoredDocument[]>([]);
   const [documentsLoading, setDocumentsLoading] = useState(false);
   const [documentsError, setDocumentsError] = useState("");
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const hasProcessingDocuments = documents.some(
+    (document) => document.index_status === "processing"
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const conversationPanelRef = useRef<HTMLDivElement>(null);
   const pendingPromptRef = useRef<string | null>(null);
@@ -634,21 +666,108 @@ function App() {
     setTypingMessageId(null);
   }, []);
   useEffect(() => {
-    void loadConversationHistory();
+    let active = true;
+    void (async () => {
+      try {
+        const silveraStatus = await getSilveraStatus();
+        if (active) {
+          setBackendStatus("online");
+          setMaxUploadMb(silveraStatus.max_upload_mb);
+        }
+        const status = await getAuthSetupStatus();
+        if (!active) return;
+        setSetupRequired(status.setup_required);
+        if (!status.setup_required) {
+          try {
+            const state = await getCurrentUser();
+            if (active) setAuthUser(state.user);
+          } catch {
+            if (active) setAuthUser(null);
+          }
+        }
+      } catch {
+        if (active) {
+          setBackendStatus("offline");
+          setAuthError("Could not connect to Silvera. Start the backend and refresh this page.");
+        }
+      } finally {
+        if (active) setAuthReady(true);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
   useEffect(() => {
-    getSilveraStatus()
-      .then(() => setBackendStatus("online"))
-      .catch(() => setBackendStatus("offline"));
+    if (authUser) void loadConversationHistory();
+  }, [authUser]);
+  useEffect(() => {
+    if (activePage !== "documents" || !authUser || !hasProcessingDocuments) {
+      return;
+    }
+
+    let active = true;
+    let timeout: number;
+    async function refreshIndexingStatus() {
+      try {
+        const latestDocuments = await getDocuments();
+        if (active) setDocuments(latestDocuments);
+      } catch (error) {
+        if (active) {
+          setDocumentsError(
+            error instanceof Error ? error.message : "Could not refresh document status."
+          );
+        }
+      } finally {
+        if (active && hasProcessingDocuments) {
+          timeout = window.setTimeout(() => {
+            void refreshIndexingStatus();
+          }, 1500);
+        }
+      }
+    }
+
+    timeout = window.setTimeout(() => {
+      void refreshIndexingStatus();
+    }, 750);
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [activePage, authUser, hasProcessingDocuments]);
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setCsrfToken("");
+      setAuthUser(null);
+      setConversations([]);
+      setConversationMessages([]);
+      setSelectedSource(null);
+      setActiveConversationId(null);
+    };
+    window.addEventListener("silvera:unauthorized", handleUnauthorized);
+    return () => window.removeEventListener("silvera:unauthorized", handleUnauthorized);
   }, []);
   useEffect(() => {
     function handleEscape(event: KeyboardEvent) {
       if (event.key === "Escape") {
         setSelectedSource(null);
+        setUserMenuOpen(false);
       }
     }
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
+  }, []);
+  useEffect(() => {
+    function handleOutsideClick(event: PointerEvent) {
+      if (
+        event.target instanceof Node &&
+        !userMenuRef.current?.contains(event.target)
+      ) {
+        setUserMenuOpen(false);
+      }
+    }
+    document.addEventListener("pointerdown", handleOutsideClick);
+    return () => document.removeEventListener("pointerdown", handleOutsideClick);
   }, []);
   useEffect(() => {
     if (!selectedSource) {
@@ -674,70 +793,55 @@ function App() {
     };
   }, [selectedSource?.document_id]);
   useEffect(() => {
-    setPdfLoading(Boolean(selectedSource && selectedSource.filename.toLocaleLowerCase().endsWith(".pdf")));
+    const isPdf = selectedSource?.filename.toLocaleLowerCase().endsWith(".pdf") ?? false;
+    setPdfLoading(Boolean(isPdf));
     setPdfError("");
     setPdfPageCount(null);
-    if (!selectedSource) {
-      setSourcePageText("");
-      setSourcePageError("");
-      setSourcePageLoading(false);
-      return;
-    }
-
-    const pageNumber =
-      (selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1;
-    const controller = new AbortController();
     setSourcePageText("");
     setSourcePageError("");
+    setSourcePageLoading(false);
+    if (!selectedSource || isPdf) {
+      return;
+    }
+    let cancelled = false;
+    const pageNumber =
+      (selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1;
     setSourcePageLoading(true);
-
-    fetch(
-      `http://127.0.0.1:8000/api/documents/${encodeURIComponent(selectedSource.document_id)}/pages/${pageNumber}`,
-      { signal: controller.signal }
-    )
-      .then(async (response) => {
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          throw new Error(
-            typeof result.detail === "string"
-              ? result.detail
-              : "Could not load the extracted page text."
-          );
-        }
-        return result as { text?: string };
+    getDocumentPage(selectedSource.document_id, pageNumber)
+      .then((page) => {
+        if (cancelled) return;
+        setSourcePageText(page.text);
       })
-      .then((result) => setSourcePageText(result.text ?? ""))
       .catch((error: unknown) => {
-        if (error instanceof Error && error.name === "AbortError") return;
+        if (cancelled) return;
         setSourcePageError(
           error instanceof Error ? error.message : "Could not load extracted document content."
         );
       })
       .finally(() => {
-        if (!controller.signal.aborted) setSourcePageLoading(false);
+        if (!cancelled) setSourcePageLoading(false);
       });
-
-    return () => controller.abort();
-  }, [selectedSource?.document_id, (selectedSource as (AskSource & { page_number?: number | null }) | null)?.page_number]);
-
-  useEffect(() => {
-    if (!sourcePageText) return;
-    const timer = window.setTimeout(() => {
-      const highlightedPassage = sourceHighlightRef.current?.querySelector<HTMLElement>(
-        '[data-source-passage-highlight="true"]'
-      );
-      highlightedPassage?.scrollIntoView({ behavior: "smooth", block: "center" });
-    }, 80);
-    return () => window.clearTimeout(timer);
-  }, [sourcePageText, selectedSource?.passage]);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedSource?.document_id,
+    selectedSource?.filename,
+    (selectedSource as (AskSource & { page_number?: number | null }) | null)?.page_number,
+  ]);
 
   // Draw highlight rectangles from the real PDF text geometry. CSS Custom
   // Highlight can misalign across PDF.js transformed spans, so use Range rects.
   useEffect(() => {
     const viewer = pdfViewerRef.current;
-    if (!viewer || !selectedSource?.passage || pdfLoading) return;
+    if (
+      !viewer ||
+      !selectedSource?.passage ||
+      !selectedSource.filename.toLowerCase().endsWith(".pdf") ||
+      pdfLoading
+    ) return;
 
-    let overlayElements: HTMLDivElement[] = [];
+      let overlayElements: HTMLDivElement[] = [];
     const timer = window.setTimeout(() => {
       const pageElement = viewer.querySelector<HTMLElement>(".react-pdf__Page");
       const textLayer = viewer.querySelector<HTMLElement>(".react-pdf__Page__textContent");
@@ -861,6 +965,7 @@ function App() {
     selectedSource?.document_id,
     (selectedSource as (AskSource & { page_number?: number | null }) | null)?.page_number,
     selectedSource?.passage,
+    selectedSource?.filename,
     pdfLoading,
   ]);
 
@@ -1036,29 +1141,35 @@ function App() {
     }
   }
   async function handleUpload() {
-    if (!selectedFiles.length || uploading) return;
+    if (selectedFiles.length === 0 || uploading) return;
     setUploading(true);
     setUploadError("");
     setUploadResults([]);
-    try {
-      const results = await Promise.all(
-        selectedFiles.map((file) => uploadDocument(file))
-      );
-      setUploadResults(results);
-      setSelectedFiles([]);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
+    const completed: DocumentUploadResult[] = [];
+    const failedFiles: File[] = [];
+    const failures: string[] = [];
+    for (const file of selectedFiles) {
+      try {
+        completed.push(await uploadDocument(file));
+      } catch (error) {
+        failedFiles.push(file);
+        failures.push(
+          `${file.name}: ${
+            error instanceof Error ? error.message : "Upload failed."
+          }`
+        );
       }
-      if (activePage === "documents") {
-        await loadDocuments();
-      }
-    } catch (error) {
-      setUploadError(
-        error instanceof Error ? error.message : "Upload failed."
-      );
-    } finally {
-      setUploading(false);
     }
+    setUploadResults(completed);
+    setSelectedFiles(failedFiles);
+    setUploadError(failures.join(" "));
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    if (completed.length > 0 && activePage === "documents") {
+      await loadDocuments();
+    }
+    setUploading(false);
   }
   async function handleSearch() {
     const query = question.trim();
@@ -1216,10 +1327,113 @@ function App() {
   }
   function openOriginalDocument() {
     if (!selectedSource) return;
-    const url = getOriginalDocumentUrl(
+    const url = getDocumentDownloadUrl(
       selectedSource.document_id
     );
     window.open(url, "_blank", "noopener,noreferrer");
+  }
+  async function submitAuthentication(event: React.FormEvent) {
+    event.preventDefault();
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const state = setupRequired
+        ? await createInitialAdmin(authName, authUsername, authPassword)
+        : await loginUser(authUsername, authPassword);
+      setAuthUser(state.user);
+      setSetupRequired(false);
+      setAuthPassword("");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Authentication failed.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+  async function signOut() {
+    try {
+      await logoutUser();
+      setAuthUser(null);
+      setConversationMessages([]);
+      setConversations([]);
+      setSelectedSource(null);
+      setActiveConversationId(null);
+      setActivePage("intelligence");
+      setAuthPassword("");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Could not sign out.");
+    }
+  }
+  async function changeOwnPassword() {
+    const currentPassword = window.prompt("Enter your current password.");
+    if (currentPassword === null) return;
+    const newPassword = window.prompt("Enter a new password (12+ characters, up to 72 UTF-8 bytes).");
+    if (newPassword === null) return;
+    try {
+      await changePassword(currentPassword, newPassword);
+      window.alert("Password changed. Other active sessions were revoked.");
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not change your password.");
+    }
+  }
+  const selectedSourceIsPdf =
+    selectedSource?.filename.toLowerCase().endsWith(".pdf") ?? false;
+  const selectedSourceSectionLabel =
+    selectedSource && !selectedSourceIsPdf
+      ? getDocumentSectionLabel(selectedSource.filename)
+      : "Page";
+  if (!authReady) {
+    return (
+      <div className="auth-screen">
+        <section className="auth-card">
+          <h1>Silvera</h1>
+          <p>Connecting to the secure workspace...</p>
+        </section>
+      </div>
+    );
+  }
+  if (!authUser) {
+    return (
+      <div className="auth-screen">
+        <form className="auth-card" onSubmit={(event) => void submitAuthentication(event)}>
+          <div className="eyebrow"><span className="status-dot" />PRIVATE WORKSPACE</div>
+          <h1>{setupRequired ? "Set up your administrator" : "Sign in to Silvera"}</h1>
+          <p className="security-muted">
+            {setupRequired
+              ? "Create the first administrator account. Existing documents, datasets and conversations will be private to this administrator until access is reviewed."
+              : "Use your organization-provided Silvera account."}
+          </p>
+          {setupRequired && (
+            <label>
+              Full name
+              <input autoComplete="name" required maxLength={100} value={authName} onChange={(event) => setAuthName(event.target.value)} />
+            </label>
+          )}
+          <label>
+            Email / username
+            <input autoComplete="username" type="email" required value={authUsername} onChange={(event) => setAuthUsername(event.target.value)} />
+          </label>
+          <label>
+            Password
+            <input
+              autoComplete={setupRequired ? "new-password" : "current-password"}
+              type="password"
+              minLength={setupRequired ? 12 : 1}
+              maxLength={128}
+              required
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+            />
+          </label>
+          {authError && <p className="security-message error" role="alert">{authError}</p>}
+          <button type="submit" className="new-chat" disabled={authBusy || backendStatus === "offline"}>
+            {authBusy ? "Please wait..." : setupRequired ? "Create administrator" : "Sign in"}
+          </button>
+          <p className="security-muted auth-footnote">
+            Authentication uses server-side sessions and HttpOnly cookies. Credentials are not stored in this browser.
+          </p>
+        </form>
+      </div>
+    );
   }
   return (
     <div className="app">
@@ -1250,8 +1464,22 @@ function App() {
         >
           ▤ &nbsp; Documents
         </button>
-        <div className="nav-item">◈ &nbsp; Data sources</div>
-        <div className="nav-item">◉ &nbsp; Activity logs</div>
+        {(authUser.role === "ADMIN" || authUser.role === "MANAGER") && (
+          <button
+            type="button"
+            className={`nav-item ${activePage === "security" ? "active" : ""}`}
+            onClick={() => setActivePage("security")}
+          >
+            ◈ &nbsp; Security &amp; governance
+          </button>
+        )}
+        <button
+          type="button"
+          className={`nav-item ${activePage === "data" ? "active" : ""}`}
+          onClick={() => setActivePage("data")}
+        >
+          ⌘ &nbsp; Data intelligence
+        </button>
         <div className="history-heading">
           <span>RECENT CONVERSATIONS</span>
           <button
@@ -1342,15 +1570,76 @@ function App() {
         </div>
       </aside>
       <main className="main">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".pdf,.docx,.docm,.xlsx,.xlsm,.pptx,.pptm,.csv,.tsv,.txt,.md,.html,.htm,.eml,.json,.xml,application/pdf,text/plain,text/csv,application/json,text/html,application/xml"
+          hidden
+          onChange={(event) => {
+            setSelectedFiles(Array.from(event.currentTarget.files ?? []));
+            event.currentTarget.value = "";
+            setUploadError("");
+            setUploadResults([]);
+          }}
+        />
         <header className="topbar">
           <span>
             Workspace /{" "}
             {activePage === "intelligence"
               ? "Intelligence"
-              : "Documents"}
+              : activePage === "documents"
+                ? "Documents"
+                : activePage === "security"
+                  ? "Security & Governance"
+                  : "Data Intelligence"}
           </span>
-          <div className="user">
-            S <span>Administrator</span>
+          <div className="user-menu" ref={userMenuRef}>
+            <button
+              type="button"
+              className="user-menu-trigger"
+              aria-label={userMenuOpen ? "Close account menu" : "Open account menu"}
+              aria-haspopup="menu"
+              aria-expanded={userMenuOpen}
+              onClick={() => setUserMenuOpen((open) => !open)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 21a8 8 0 0 0-16 0" />
+                <circle cx="12" cy="8" r="4" />
+              </svg>
+            </button>
+            {userMenuOpen && (
+              <div className="user-menu-dropdown" role="menu" aria-label="Account">
+                <div className="user-menu-identity">
+                  <strong>{authUser.name}</strong>
+                  <span>{authUser.username}</span>
+                  <span className="user-menu-role">{authUser.role}</span>
+                </div>
+                <div className="user-menu-actions">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setUserMenuOpen(false);
+                      void changeOwnPassword();
+                    }}
+                  >
+                    Change password
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="user-menu-signout"
+                    onClick={() => {
+                      setUserMenuOpen(false);
+                      void signOut();
+                    }}
+                  >
+                    Sign out
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </header>
         {activePage === "intelligence" && (
@@ -1742,36 +2031,24 @@ function App() {
                     Upload documents and ask questions about their
                     extracted text.
                   </p>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    multiple
-                    accept=".pdf,.docx,.docm,.xlsx,.xlsm,.pptx,.pptm,.csv,.tsv,.txt,.md,.html,.htm,.eml,.json,.xml,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/csv,application/json,text/xml,application/xml"
-                    hidden
-                    onChange={(event) => {
-                      setSelectedFiles(Array.from(event.target.files ?? []));
-                      setUploadError("");
-                      setUploadResults([]);
-                    }}
-                  />
                   <button
                     className="new-chat"
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
                     disabled={uploading}
                   >
-                    Choose files
+                    Choose documents
                   </button>
                   {selectedFiles.length > 0 && (
                     <div className="upload-details">
-                      <p>
-                        Selected: {selectedFiles.map((file) => file.name).join(", ")}
-                      </p>
-                      <p>
-                        Total size:{" "}
-                        {(selectedFiles.reduce((total, file) => total + file.size, 0) / (1024 * 1024)).toFixed(2)}{" "}
-                        MB
-                      </p>
+                      <p>{selectedFiles.length} document(s) selected:</p>
+                      <ul className="upload-file-list">
+                        {selectedFiles.map((file, index) => (
+                          <li key={`${file.name}-${file.lastModified}-${index}`}>
+                            {file.name} · {(file.size / (1024 * 1024)).toFixed(2)} MB
+                          </li>
+                        ))}
+                      </ul>
                       <button
                         className="upload-button"
                         type="button"
@@ -1780,7 +2057,7 @@ function App() {
                       >
                         {uploading
                           ? "Uploading..."
-                          : `Upload ${selectedFiles.length} document${selectedFiles.length === 1 ? "" : "s"} ↑`}
+                          : `Upload ${selectedFiles.length} document(s) ↑`}
                       </button>
                     </div>
                   )}
@@ -1789,49 +2066,49 @@ function App() {
                       {uploadError}
                     </p>
                   )}
-                  {uploadResults.length > 0 && (
-                    <div className="upload-success" role="status">
-                      {uploadResults.map((uploadResult) => (
-                        <div key={uploadResult.document_id} style={{ marginBottom: "12px" }}>
-                          <p>✓ {uploadResult.message}</p>
-                          <p>File: {uploadResult.filename}</p>
-                          <p>Pages: {uploadResult.pages}</p>
-                          <p>
-                            Characters extracted:{" "}
-                            {uploadResult.characters_extracted}
-                          </p>
-                          <details>
-                            <summary>View extracted text</summary>
-                            <pre>{uploadResult.preview}</pre>
-                          </details>
-                        </div>
-                      ))}
+                  {uploadResults.map((result) => (
+                    <div className="upload-success" role="status" key={result.document_id}>
+                      <p>✓ {result.filename}: {result.message}</p>
+                      <p>Pages / sections: {result.pages}</p>
+                      <p>Characters extracted: {result.characters_extracted}</p>
+                      <details>
+                        <summary>View extracted text</summary>
+                        <pre>{result.preview}</pre>
+                      </details>
                     </div>
-                  )}
+                  ))}
                 </article>
-                <article className="feature-card">
+                <article className="feature-card data-feature">
                   <div className="feature-icon">⌘</div>
                   <h3>Data intelligence</h3>
                   <p>
-                    Ask questions about uploaded CSV, TSV, and Excel data.
-                    Silvera generates and runs read-only SQL.
+                    Ask questions, inspect generated SQL, and safely query
+                    authorized spreadsheet data.
                   </p>
                   <button
-                    className="new-chat"
                     type="button"
-                    onClick={() => setDataMode(true)}
+                    className="feature-status security-open"
+                    onClick={() => setActivePage("data")}
                   >
-                    Use Spreadsheet SQL
+                    OPEN WORKSPACE
                   </button>
                 </article>
                 <article className="feature-card">
                   <div className="feature-icon">⬡</div>
                   <h3>Security &amp; governance</h3>
                   <p>
-                    Build toward controlled access, audit trails and
-                    permission-aware AI retrieval.
+                    Manage accounts, permissions, audit history and
+                    retention policies.
                   </p>
-                  <span className="feature-status">PLANNED</span>
+                  {(authUser.role === "ADMIN" || authUser.role === "MANAGER") && (
+                    <button
+                      type="button"
+                      className="feature-status security-open"
+                      onClick={() => setActivePage("security")}
+                    >
+                      OPEN WORKSPACE
+                    </button>
+                  )}
                 </article>
               </div>
             </section>
@@ -1845,7 +2122,9 @@ function App() {
             </div>
             <h1>Document library</h1>
             <p className="description">
-              Manage the documents stored in your Silvera workspace.
+            Upload and manage documents stored in your Silvera workspace.
+            Supported: PDF, DOCX/DOCM, XLSX/XLSM, PPTX/PPTM, CSV/TSV,
+            TXT/MD, HTML, EML, JSON, and XML. Maximum file size: {maxUploadMb} MB.
             </p>
             <div className="documents-toolbar">
               <button
@@ -1859,11 +2138,53 @@ function App() {
               </button>
               <button
                 className="new-chat"
-                onClick={() => setActivePage("intelligence")}
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
               >
                 + Upload a document
               </button>
             </div>
+            {selectedFiles.length > 0 && (
+              <div className="documents-upload-panel">
+                <div className="upload-details">
+                  <p><strong>{selectedFiles.length} document(s) selected:</strong></p>
+                  <ul className="upload-file-list">
+                    {selectedFiles.map((file, index) => (
+                      <li key={`${file.name}-${file.lastModified}-${index}`}>
+                        {file.name} · {(file.size / (1024 * 1024)).toFixed(2)} MB
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <button
+                  className="upload-button"
+                  type="button"
+                  onClick={() => void handleUpload()}
+                  disabled={uploading}
+                >
+                  {uploading
+                    ? "Uploading..."
+                    : `Upload ${selectedFiles.length} document(s) ↑`}
+                </button>
+              </div>
+            )}
+            {uploadError && (
+              <p className="upload-error" role="alert">
+                {uploadError}
+              </p>
+            )}
+            {uploadResults.map((result) => (
+              <div className="upload-success" role="status" key={result.document_id}>
+                <p>✓ {result.filename}: {result.message}</p>
+                <p>Pages / sections: {result.pages}</p>
+                <p>Characters extracted: {result.characters_extracted}</p>
+                <details>
+                  <summary>View extracted text</summary>
+                  <pre>{result.preview}</pre>
+                </details>
+              </div>
+            ))}
             {documentsError && (
               <p className="upload-error" role="alert">
                 {documentsError}
@@ -1877,12 +2198,6 @@ function App() {
                 <p>
                   Upload a document to start building your knowledge base.
                 </p>
-                <button
-                  className="new-chat"
-                  onClick={() => setActivePage("intelligence")}
-                >
-                  Go to Intelligence
-                </button>
               </div>
             )}
             {!documentsLoading && documents.length > 0 && (
@@ -1898,8 +2213,12 @@ function App() {
                         <h3>{document.filename}</h3>
                         <p>
                           {document.pages == null
-                            ? "Page count unavailable"
-                            : `${document.pages} page(s)`}
+                            ? "Page / section count unavailable"
+                            : `${document.pages} ${
+                                document.filename.toLowerCase().endsWith(".pdf")
+                                  ? "page(s)"
+                                  : `${getDocumentSectionLabel(document.filename).toLowerCase()}(s)`
+                              }`}
                           {" · "}
                           {document.characters_extracted.toLocaleString()}{" "}
                           characters
@@ -1911,6 +2230,21 @@ function App() {
                               ).toLocaleString()}`
                             : "Upload date unavailable"}
                         </p>
+                        {document.index_status === "processing" && (
+                          <p className="document-index-status" role="status">
+                            Indexing for search: {document.index_progress}%
+                          </p>
+                        )}
+                        {document.index_status === "ready" && (
+                          <p className="document-index-status">
+                            Ready to search
+                          </p>
+                        )}
+                        {document.index_status === "failed" && (
+                          <p className="document-index-error" role="alert">
+                            Indexing failed: {document.index_error || "Search is unavailable for this document."}
+                          </p>
+                        )}
                       </div>
                     </div>
                     <button
@@ -1928,6 +2262,10 @@ function App() {
             )}
           </section>
         )}
+        {activePage === "security" && (
+          <SecurityWorkspace user={authUser} />
+        )}
+        {activePage === "data" && <DataWorkspace />}
         <footer>
           <span>SILVERA © 2026</span>
           <span>PRIVATE BY DESIGN · BUILT LOCALLY</span>
@@ -1956,7 +2294,7 @@ function App() {
               <div className="source-modal-file-info">
                 <span className="source-modal-filename">{selectedSource.filename}</span>
                 <span className="source-modal-subtitle">
-                  {isPdfSource ? "PDF page" : "Document section"}{" "}
+                  {selectedSourceIsPdf ? "PDF page" : selectedSourceSectionLabel}{" "}
                   {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
                   {" · "}Retrieved from your local knowledge base
                 </span>
@@ -1987,15 +2325,15 @@ function App() {
                   </div>
                 )}
                 <p style={{ color: "#91a6ad", fontSize: "0.78em", marginTop: "14px" }}>
-                  {isPdfSource
+                  {selectedSourceIsPdf
                     ? "Exact text passage retrieved for this answer. Inspect the PDF alongside it for original context."
-                    : "Exact text passage retrieved for this answer. The extracted content is shown alongside it for context."}
+                    : "Exact text passage retrieved for this answer, shown alongside the extracted document section."}
                 </p>
               </aside>
 
               <div style={{ display: "flex", flexDirection: "column", minWidth: 0, minHeight: "420px", border: "1px solid rgba(133, 153, 176, 0.18)", borderRadius: "10px", overflow: "hidden", background: "#0b1118" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", padding: "9px 12px", borderBottom: "1px solid rgba(133, 153, 176, 0.16)", color: "#cbd6df", fontSize: "0.82em" }}>
-                  <span>{isPdfSource ? "ORIGINAL PDF DOCUMENT" : "EXTRACTED DOCUMENT CONTENT"}</span>
+                  <span>{selectedSourceIsPdf ? "ORIGINAL PDF DOCUMENT" : "EXTRACTED DOCUMENT TEXT"}</span>
                   <div style={{ display: "flex", alignItems: "center", gap: "9px" }}>
                     <button
                       type="button"
@@ -2007,7 +2345,7 @@ function App() {
                       }}
                     >←</button>
                     <span>
-                      {isPdfSource ? "Page" : "Section"}{" "}
+                      {selectedSourceSectionLabel}{" "}
                       {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
                       {sourcePageCount || pdfPageCount ? ` of ${sourcePageCount ?? pdfPageCount}` : ""}
                     </span>
@@ -2075,6 +2413,7 @@ function App() {
                     <PdfDocument
                       key={selectedSource.document_id}
                       file={getOriginalDocumentUrl(selectedSource.document_id)}
+                      options={{ withCredentials: true }}
                       onLoadSuccess={({ numPages }) => {
                         setPdfPageCount(numPages);
                         setPdfLoading(false);
