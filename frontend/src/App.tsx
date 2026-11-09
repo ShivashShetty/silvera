@@ -7,6 +7,9 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import CodeMirror from "@uiw/react-codemirror";
+import { sql } from "@codemirror/lang-sql";
+import { oneDark } from "@codemirror/theme-one-dark";
 import { Document as PdfDocument, Page as PdfPage, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -25,6 +28,7 @@ import {
   type DocumentUploadResult,
   type AskResponse,
   type AskSource,
+  type StructuredQueryResult,
   type StoredDocument,
 } from "./services/api";
 import "./App.css";
@@ -42,11 +46,12 @@ function normalizeMarkdown(text: string) {
   return text.replace(/\\([|*`_])/g, "$1");
 }
 
-function findPassageRange(pageText: string, passage: string): [number, number] | null {
+function renderHighlightedText(text: string, passage: string): ReactNode {
   const normalizeWithPositions = (value: string) => {
     let normalized = "";
     const positions: number[] = [];
     let previousWasWhitespace = false;
+
     for (let index = 0; index < value.length; index += 1) {
       const character = value[index];
       if (/\s/.test(character)) {
@@ -61,6 +66,7 @@ function findPassageRange(pageText: string, passage: string): [number, number] |
         previousWasWhitespace = false;
       }
     }
+
     while (normalized.startsWith(" ")) {
       normalized = normalized.slice(1);
       positions.shift();
@@ -72,36 +78,45 @@ function findPassageRange(pageText: string, passage: string): [number, number] |
     return { normalized, positions };
   };
 
-  const page = normalizeWithPositions(pageText);
+  const source = normalizeWithPositions(text);
   const target = normalizeWithPositions(passage.trim());
-  if (!target.normalized) return null;
-  const start = page.normalized.indexOf(target.normalized);
-  if (start < 0) return null;
-  const originalStart = page.positions[start];
-  const originalEnd = page.positions[start + target.normalized.length - 1] + 1;
-  return [originalStart, originalEnd];
-}
+  if (!target.normalized) return text;
 
-function renderPageWithHighlight(pageText: string, passage: string): ReactNode {
-  const range = findPassageRange(pageText, passage);
-  if (!range) return pageText;
+  let start = source.normalized.indexOf(target.normalized);
+  let matchLength = target.normalized.length;
+  if (start < 0) {
+    const passageWords = target.normalized.split(" ").filter(Boolean);
+    for (let size = Math.min(18, passageWords.length); size >= 7 && start < 0; size -= 1) {
+      for (let offset = 0; offset <= passageWords.length - size; offset += 1) {
+        const candidate = passageWords.slice(offset, offset + size).join(" ");
+        const candidateStart = source.normalized.indexOf(candidate);
+        if (candidateStart >= 0) {
+          start = candidateStart;
+          matchLength = candidate.length;
+          break;
+        }
+      }
+    }
+  }
+  if (start < 0) return text;
+
+  const originalStart = source.positions[start];
+  const originalEnd = source.positions[start + matchLength - 1] + 1;
   return (
     <>
-      {pageText.slice(0, range[0])}
+      {text.slice(0, originalStart)}
       <mark
-        data-source-passage-highlight="true"
         style={{
           background: "rgba(105, 190, 169, 0.28)",
           color: "#d9fff3",
           border: "1px solid rgba(105, 190, 169, 0.55)",
           borderRadius: "4px",
           padding: "1px 2px",
-          boxShadow: "0 0 14px rgba(105, 190, 169, 0.12)",
         }}
       >
-        {pageText.slice(range[0], range[1])}
+        {text.slice(originalStart, originalEnd)}
       </mark>
-      {pageText.slice(range[1])}
+      {text.slice(originalEnd)}
     </>
   );
 }
@@ -569,6 +584,7 @@ function App() {
     useState<ConversationMessage[]>([]);
   const [backendStatus, setBackendStatus] = useState("checking");
   const [activePage, setActivePage] = useState<Page>("intelligence");
+  const [dataMode, setDataMode] = useState(false);
   const [conversations, setConversations] =
     useState<ConversationSummary[]>([]);
   const [activeConversationId, setActiveConversationId] =
@@ -579,23 +595,27 @@ function App() {
     useState<string | null>(null);
   const [deletingConversationId, setDeletingConversationId] =
     useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
-  const [uploadResult, setUploadResult] =
-    useState<DocumentUploadResult | null>(null);
+  const [uploadResults, setUploadResults] =
+    useState<DocumentUploadResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [searchResult, setSearchResult] =
     useState<AskResponse | null>(null);
+  const [structuredQueryResult, setStructuredQueryResult] =
+    useState<StructuredQueryResult | null>(null);
+  const [sqlDraft, setSqlDraft] = useState("");
+  const [structuredQuestion, setStructuredQuestion] = useState("");
   const [typingMessageId, setTypingMessageId] =
     useState<string | null>(null);
   const [selectedSource, setSelectedSource] =
     useState<AskSource | null>(null);
   const [sourcePageCount, setSourcePageCount] = useState<number | null>(null);
   const [sourcePageText, setSourcePageText] = useState("");
-  const [sourcePageLoading, setSourcePageLoading] = useState(false);
   const [sourcePageError, setSourcePageError] = useState("");
+  const [sourcePageLoading, setSourcePageLoading] = useState(false);
   const [pdfPageCount, setPdfPageCount] = useState<number | null>(null);
   const [pdfLoading, setPdfLoading] = useState(true);
   const [pdfError, setPdfError] = useState("");
@@ -608,6 +628,7 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const conversationPanelRef = useRef<HTMLDivElement>(null);
   const pendingPromptRef = useRef<string | null>(null);
+  const isPdfSource = selectedSource?.filename.toLocaleLowerCase().endsWith(".pdf") ?? false;
   // Stable callback: the animation effect won't restart on each render.
   const handleTypingComplete = useCallback(() => {
     setTypingMessageId(null);
@@ -653,21 +674,22 @@ function App() {
     };
   }, [selectedSource?.document_id]);
   useEffect(() => {
-    setPdfLoading(Boolean(selectedSource));
+    setPdfLoading(Boolean(selectedSource && selectedSource.filename.toLocaleLowerCase().endsWith(".pdf")));
     setPdfError("");
     setPdfPageCount(null);
     if (!selectedSource) {
       setSourcePageText("");
       setSourcePageError("");
+      setSourcePageLoading(false);
       return;
     }
 
     const pageNumber =
       (selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1;
     const controller = new AbortController();
-    setSourcePageLoading(true);
-    setSourcePageError("");
     setSourcePageText("");
+    setSourcePageError("");
+    setSourcePageLoading(true);
 
     fetch(
       `http://127.0.0.1:8000/api/documents/${encodeURIComponent(selectedSource.document_id)}/pages/${pageNumber}`,
@@ -688,7 +710,7 @@ function App() {
       .catch((error: unknown) => {
         if (error instanceof Error && error.name === "AbortError") return;
         setSourcePageError(
-          error instanceof Error ? error.message : "Could not load the extracted page text."
+          error instanceof Error ? error.message : "Could not load extracted document content."
         );
       })
       .finally(() => {
@@ -951,6 +973,9 @@ function App() {
       setQuestion("");
       setSearchError("");
       setSearchResult(null);
+      setStructuredQueryResult(null);
+      setSqlDraft("");
+      setStructuredQuestion("");
       setConversationMessages(conversation.messages ?? []);
       setSelectedSource(null);
       requestAnimationFrame(() => {
@@ -1011,14 +1036,16 @@ function App() {
     }
   }
   async function handleUpload() {
-    if (!selectedFile || uploading) return;
+    if (!selectedFiles.length || uploading) return;
     setUploading(true);
     setUploadError("");
-    setUploadResult(null);
+    setUploadResults([]);
     try {
-      const result = await uploadDocument(selectedFile);
-      setUploadResult(result);
-      setSelectedFile(null);
+      const results = await Promise.all(
+        selectedFiles.map((file) => uploadDocument(file))
+      );
+      setUploadResults(results);
+      setSelectedFiles([]);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
@@ -1040,6 +1067,9 @@ function App() {
     setSearchError("");
     setSelectedSource(null);
     setSearchResult(null);
+    setStructuredQueryResult(null);
+    setSqlDraft("");
+    setStructuredQuestion(dataMode ? query : "");
     setTypingMessageId(null);
     setQuestion("");
     pendingPromptRef.current = query;
@@ -1055,7 +1085,14 @@ function App() {
       temporaryMessage,
     ]);
     try {
-      const result = await askSilvera(query, activeConversationId);
+      const result = await askSilvera(query, activeConversationId, dataMode);
+      if (dataMode && !result.structured_query) {
+        throw new Error("Silvera did not return the generated SQL query.");
+      }
+      if (result.structured_query) {
+        setStructuredQueryResult(result.structured_query);
+        setSqlDraft(result.structured_query.sql);
+      }
       setActiveConversationId(result.conversation_id);
       const conversation = await getConversation(
         result.conversation_id
@@ -1083,6 +1120,34 @@ function App() {
         error instanceof Error
           ? error.message
           : "Silvera could not generate an answer."
+      );
+    } finally {
+      setSearching(false);
+    }
+  }
+  async function handleRunSql() {
+    const query = structuredQuestion;
+    const sql = sqlDraft.trim();
+    if (!query || !sql || searching) return;
+
+    setSearching(true);
+    setSearchError("");
+    setTypingMessageId(null);
+    try {
+      const result = await askSilvera(query, activeConversationId, true, sql);
+      if (!result.structured_query) {
+        throw new Error("Silvera did not return the SQL query results.");
+      }
+      setStructuredQueryResult(result.structured_query);
+      setSqlDraft(result.structured_query.sql);
+      setActiveConversationId(result.conversation_id);
+      const conversation = await getConversation(result.conversation_id);
+      setConversationMessages(conversation.messages ?? []);
+      setSearchResult(result);
+      await loadConversationHistory();
+    } catch (error) {
+      setSearchError(
+        error instanceof Error ? error.message : "Could not run the edited SQL."
       );
     } finally {
       setSearching(false);
@@ -1135,10 +1200,13 @@ function App() {
     setConversationMessages([]);
     setQuestion("");
     setSearchResult(null);
+    setStructuredQueryResult(null);
+    setSqlDraft("");
+    setStructuredQuestion("");
     setSearchError("");
-    setUploadResult(null);
+    setUploadResults([]);
     setUploadError("");
-    setSelectedFile(null);
+    setSelectedFiles([]);
     setSelectedSource(null);
     setActivePage("intelligence");
   }
@@ -1315,24 +1383,69 @@ function App() {
                       void handleSearch();
                     }
                   }}
-                  placeholder="Ask a question about your documents..."
+                  placeholder={
+                    dataMode
+                      ? "Ask a question about uploaded CSV, TSV, or Excel data..."
+                      : "Ask a question about your documents..."
+                  }
                   rows={3}
                   maxLength={1000}
                   aria-label="Ask Silvera a question"
                 />
                 <div className="search-footer">
-                  <span>↳ AI-powered document Q&amp;A</span>
+                  <div
+                    role="group"
+                    aria-label="Choose what to ask"
+                    style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setDataMode(false)}
+                      aria-pressed={!dataMode}
+                      disabled={searching}
+                      style={{
+                        border: `1px solid ${!dataMode ? "rgba(105, 190, 169, 0.45)" : "rgba(133, 153, 176, 0.2)"}`,
+                        borderRadius: "7px",
+                        padding: "6px 9px",
+                        background: !dataMode ? "rgba(105, 190, 169, 0.12)" : "transparent",
+                        color: !dataMode ? "#9bd6c5" : "#91a0ad",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Documents
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDataMode(true)}
+                      aria-pressed={dataMode}
+                      disabled={searching}
+                      style={{
+                        border: `1px solid ${dataMode ? "rgba(105, 190, 169, 0.45)" : "rgba(133, 153, 176, 0.2)"}`,
+                        borderRadius: "7px",
+                        padding: "6px 9px",
+                        background: dataMode ? "rgba(105, 190, 169, 0.12)" : "transparent",
+                        color: dataMode ? "#9bd6c5" : "#91a0ad",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Spreadsheet SQL
+                    </button>
+                  </div>
                   <button
                     onClick={() => void handleSearch()}
                     disabled={!question.trim() || searching}
                   >
-                    {searching ? "Thinking..." : "Ask Silvera ↗"}
+                    {searching
+                      ? dataMode ? "Querying..." : "Thinking..."
+                      : dataMode ? "Ask data ↗" : "Ask Silvera ↗"}
                   </button>
                 </div>
               </div>
               <p className="notice">
-                <span>◇</span> Answers grounded in your documents,
-                powered by your local AI model.
+                <span>◇</span>{" "}
+                {dataMode
+                  ? "Read-only SQL over uploaded spreadsheet data. Generated queries and results are shown."
+                  : "Answers grounded in your documents, powered by your local AI model."}
               </p>
               {searchError && (
                 <div className="search-results" role="alert">
@@ -1346,8 +1459,127 @@ function App() {
                 >
                   <span className="loading-orb" />
                   <p>Searching your knowledge base...</p>
-                  <span>Silvera is preparing your answer</span>
+                  <span>
+                    {dataMode
+                      ? "Generating a read-only spreadsheet query..."
+                      : "Silvera is preparing your answer"}
+                  </span>
                 </div>
+              )}
+              {dataMode && structuredQueryResult && (
+                <section
+                  aria-label="Editable SQL query and results"
+                  className="search-results"
+                  style={{
+                    marginTop: "18px",
+                    padding: "18px",
+                    border: "1px solid rgba(105, 190, 169, 0.22)",
+                    borderRadius: "12px",
+                    background: "rgba(12, 19, 27, 0.94)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: "12px",
+                      marginBottom: "12px",
+                    }}
+                  >
+                    <div>
+                      <h3 style={{ margin: 0 }}>Generated SQL</h3>
+                      <p style={{ margin: "5px 0 0", color: "#91a6ad", fontSize: "0.82em" }}>
+                        Edit this read-only query and run it against the uploaded spreadsheet data.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="upload-button"
+                      onClick={() => void handleRunSql()}
+                      disabled={searching || !sqlDraft.trim()}
+                    >
+                      {searching ? "Running..." : "Run SQL ↗"}
+                    </button>
+                  </div>
+                  <div
+                    className="sql-code-editor"
+                    style={{
+                      width: "100%",
+                      border: "1px solid rgba(133, 153, 176,  0.24)",
+                      borderRadius: "9px",
+                      background: "#080d13",
+                    }}
+                  >
+                    <CodeMirror
+                      aria-label="Editable SQL query"
+                      value={sqlDraft}
+                      onChange={setSqlDraft}
+                      extensions={[sql()]}
+                      theme={oneDark}
+                      height={`${Math.min(16, Math.max(5, sqlDraft.split("\n").length + 1)) * 23 + 16}px`}
+                      basicSetup={{ foldGutter: false }}
+                    />
+                  </div>
+                  <div style={{ marginTop: "18px" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        justifyContent: "space-between",
+                        gap: "8px",
+                        color: "#aebdc7",
+                        fontSize: "0.82em",
+                        marginBottom: "10px",
+                      }}
+                    >
+                      <strong>Results</strong>
+                      <span>
+                        Source: {structuredQueryResult.sources.join(", ") || "Uploaded spreadsheet"}
+                        {structuredQueryResult.truncated ? " · Results capped" : ""}
+                      </span>
+                    </div>
+                    {structuredQueryResult.columns.length === 0 ? (
+                      <p style={{ color: "#b8c5d2" }}>The query returned no result columns.</p>
+                    ) : structuredQueryResult.rows.length === 0 ? (
+                      <p style={{ color: "#b8c5d2" }}>No rows matched the query.</p>
+                    ) : (
+                      <div style={{ width: "100%", overflowX: "auto", border: "1px solid rgba(133, 153, 176, 0.18)", borderRadius: "8px" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", color: "#d4dce6", fontSize: "0.88em" }}>
+                          <thead>
+                            <tr>
+                              {structuredQueryResult.columns.map((column, index) => (
+                                <th
+                                  key={`${column}-${index}`}
+                                  style={{ padding: "10px 12px", background: "#18232f", borderBottom: "1px solid rgba(133, 153, 176, 0.22)", whiteSpace: "nowrap" }}
+                                >
+                                  {column}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {structuredQueryResult.rows.map((row, rowIndex) => (
+                              <tr key={rowIndex}>
+                                {structuredQueryResult.columns.map((_, columnIndex) => (
+                                  <td
+                                    key={`${rowIndex}-${columnIndex}`}
+                                    style={{ padding: "9px 12px", borderBottom: "1px solid rgba(133, 153, 176, 0.12)", maxWidth: "360px", overflowWrap: "anywhere" }}
+                                  >
+                                    {row[columnIndex] == null ? "NULL" : String(row[columnIndex])}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                    <p style={{ marginBottom: 0, color: "#82969e", fontSize: "0.78em" }}>
+                      {structuredQueryResult.rows.length} row(s) returned. Only read-only queries against uploaded data are allowed.
+                    </p>
+                  </div>
+                </section>
               )}
               {conversationMessages.length > 0 && (
                 <div
@@ -1507,20 +1739,19 @@ function App() {
                   <div className="feature-icon">▤</div>
                   <h3>Knowledge intelligence</h3>
                   <p>
-                    Upload PDF documents and ask questions about their
+                    Upload documents and ask questions about their
                     extracted text.
                   </p>
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept=".pdf,application/pdf"
+                    multiple
+                    accept=".pdf,.docx,.docm,.xlsx,.xlsm,.pptx,.pptm,.csv,.tsv,.txt,.md,.html,.htm,.eml,.json,.xml,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/csv,application/json,text/xml,application/xml"
                     hidden
                     onChange={(event) => {
-                      setSelectedFile(
-                        event.target.files?.[0] ?? null
-                      );
+                      setSelectedFiles(Array.from(event.target.files ?? []));
                       setUploadError("");
-                      setUploadResult(null);
+                      setUploadResults([]);
                     }}
                   />
                   <button
@@ -1529,14 +1760,16 @@ function App() {
                     onClick={() => fileInputRef.current?.click()}
                     disabled={uploading}
                   >
-                    Choose PDF
+                    Choose files
                   </button>
-                  {selectedFile && (
+                  {selectedFiles.length > 0 && (
                     <div className="upload-details">
-                      <p>Selected: {selectedFile.name}</p>
                       <p>
-                        Size:{" "}
-                        {(selectedFile.size / (1024 * 1024)).toFixed(2)}{" "}
+                        Selected: {selectedFiles.map((file) => file.name).join(", ")}
+                      </p>
+                      <p>
+                        Total size:{" "}
+                        {(selectedFiles.reduce((total, file) => total + file.size, 0) / (1024 * 1024)).toFixed(2)}{" "}
                         MB
                       </p>
                       <button
@@ -1547,7 +1780,7 @@ function App() {
                       >
                         {uploading
                           ? "Uploading..."
-                          : "Upload document ↑"}
+                          : `Upload ${selectedFiles.length} document${selectedFiles.length === 1 ? "" : "s"} ↑`}
                       </button>
                     </div>
                   )}
@@ -1556,18 +1789,23 @@ function App() {
                       {uploadError}
                     </p>
                   )}
-                  {uploadResult && (
+                  {uploadResults.length > 0 && (
                     <div className="upload-success" role="status">
-                      <p>✓ {uploadResult.message}</p>
-                      <p>Pages: {uploadResult.pages}</p>
-                      <p>
-                        Characters extracted:{" "}
-                        {uploadResult.characters_extracted}
-                      </p>
-                      <details>
-                        <summary>View extracted text</summary>
-                        <pre>{uploadResult.preview}</pre>
-                      </details>
+                      {uploadResults.map((uploadResult) => (
+                        <div key={uploadResult.document_id} style={{ marginBottom: "12px" }}>
+                          <p>✓ {uploadResult.message}</p>
+                          <p>File: {uploadResult.filename}</p>
+                          <p>Pages: {uploadResult.pages}</p>
+                          <p>
+                            Characters extracted:{" "}
+                            {uploadResult.characters_extracted}
+                          </p>
+                          <details>
+                            <summary>View extracted text</summary>
+                            <pre>{uploadResult.preview}</pre>
+                          </details>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </article>
@@ -1575,10 +1813,16 @@ function App() {
                   <div className="feature-icon">⌘</div>
                   <h3>Data intelligence</h3>
                   <p>
-                    Ask questions about business data and uncover useful
-                    insights without writing SQL.
+                    Ask questions about uploaded CSV, TSV, and Excel data.
+                    Silvera generates and runs read-only SQL.
                   </p>
-                  <span className="feature-status">PLANNED</span>
+                  <button
+                    className="new-chat"
+                    type="button"
+                    onClick={() => setDataMode(true)}
+                  >
+                    Use Spreadsheet SQL
+                  </button>
                 </article>
                 <article className="feature-card">
                   <div className="feature-icon">⬡</div>
@@ -1631,7 +1875,7 @@ function App() {
                 <div className="feature-icon">▤</div>
                 <h3>No documents yet</h3>
                 <p>
-                  Upload a PDF to start building your knowledge base.
+                  Upload a document to start building your knowledge base.
                 </p>
                 <button
                   className="new-chat"
@@ -1712,7 +1956,8 @@ function App() {
               <div className="source-modal-file-info">
                 <span className="source-modal-filename">{selectedSource.filename}</span>
                 <span className="source-modal-subtitle">
-                  PDF page {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
+                  {isPdfSource ? "PDF page" : "Document section"}{" "}
+                  {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
                   {" · "}Retrieved from your local knowledge base
                 </span>
               </div>
@@ -1742,13 +1987,15 @@ function App() {
                   </div>
                 )}
                 <p style={{ color: "#91a6ad", fontSize: "0.78em", marginTop: "14px" }}>
-                  Exact text passage retrieved for this answer. Inspect the PDF alongside it for original context.
+                  {isPdfSource
+                    ? "Exact text passage retrieved for this answer. Inspect the PDF alongside it for original context."
+                    : "Exact text passage retrieved for this answer. The extracted content is shown alongside it for context."}
                 </p>
               </aside>
 
               <div style={{ display: "flex", flexDirection: "column", minWidth: 0, minHeight: "420px", border: "1px solid rgba(133, 153, 176, 0.18)", borderRadius: "10px", overflow: "hidden", background: "#0b1118" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", padding: "9px 12px", borderBottom: "1px solid rgba(133, 153, 176, 0.16)", color: "#cbd6df", fontSize: "0.82em" }}>
-                  <span>ORIGINAL PDF DOCUMENT</span>
+                  <span>{isPdfSource ? "ORIGINAL PDF DOCUMENT" : "EXTRACTED DOCUMENT CONTENT"}</span>
                   <div style={{ display: "flex", alignItems: "center", gap: "9px" }}>
                     <button
                       type="button"
@@ -1760,7 +2007,8 @@ function App() {
                       }}
                     >←</button>
                     <span>
-                      Page {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
+                      {isPdfSource ? "Page" : "Section"}{" "}
+                      {(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
                       {sourcePageCount || pdfPageCount ? ` of ${sourcePageCount ?? pdfPageCount}` : ""}
                     </span>
                     <button
@@ -1779,41 +2027,77 @@ function App() {
                   className="silvera-pdf-viewer"
                   style={{ flex: 1, minHeight: "420px", overflow: "auto", padding: "18px", background: "#202833" }}
                 >
-                  {pdfLoading && (
+                  {isPdfSource && pdfLoading && (
                     <p style={{ color: "#b8c5d2", textAlign: "center", padding: "24px" }}>
                       Loading original PDF...
                     </p>
                   )}
-                  {pdfError && (
+                  {isPdfSource && pdfError && (
                     <p role="alert" style={{ color: "#e58c8c", padding: "18px" }}>
                       {pdfError}
                     </p>
                   )}
-                  <PdfDocument
-                    key={selectedSource.document_id}
-                    file={getOriginalDocumentUrl(selectedSource.document_id)}
-                    onLoadSuccess={({ numPages }) => {
-                      setPdfPageCount(numPages);
-                      setPdfLoading(false);
-                      setPdfError("");
-                    }}
-                    onLoadError={(error) => {
-                      setPdfLoading(false);
-                      setPdfError(error instanceof Error ? error.message : "Could not render this PDF.");
-                    }}
-                    loading={null}
-                    error={null}
-                    className="silvera-pdf-document"
-                  >
-                    <PdfPage
-                      key={`${selectedSource.document_id}-${(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}`}
-                      pageNumber={(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
-                      renderTextLayer
-                      renderAnnotationLayer
-                      onRenderSuccess={() => setPdfLoading(false)}
-                      width={Math.max(280, Math.min(760, (typeof window !== "undefined" ? window.innerWidth : 1200) * 0.52))}
-                    />
-                  </PdfDocument>
+                  {!isPdfSource && (
+                    sourcePageLoading ? (
+                      <p style={{ color: "#b8c5d2", textAlign: "center", padding: "24px" }}>
+                        Loading extracted document content...
+                      </p>
+                    ) : sourcePageError ? (
+                      <p role="alert" style={{ color: "#e58c8c", padding: "18px" }}>
+                        {sourcePageError}
+                      </p>
+                    ) : sourcePageText ? (
+                      <div
+                        ref={sourceHighlightRef}
+                        style={{
+                          maxWidth: "900px",
+                          margin: "0 auto",
+                          padding: "20px",
+                          borderRadius: "8px",
+                          background: "#fff",
+                          color: "#1d2730",
+                          fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace",
+                          fontSize: "0.9rem",
+                          lineHeight: 1.65,
+                          whiteSpace: "pre-wrap",
+                          overflowWrap: "anywhere",
+                        }}
+                      >
+                        {renderHighlightedText(sourcePageText, selectedSource.passage)}
+                      </div>
+                    ) : (
+                      <p style={{ color: "#b8c5d2", textAlign: "center", padding: "24px" }}>
+                        No extracted content is available for this section.
+                      </p>
+                    )
+                  )}
+                  {isPdfSource && (
+                    <PdfDocument
+                      key={selectedSource.document_id}
+                      file={getOriginalDocumentUrl(selectedSource.document_id)}
+                      onLoadSuccess={({ numPages }) => {
+                        setPdfPageCount(numPages);
+                        setPdfLoading(false);
+                        setPdfError("");
+                      }}
+                      onLoadError={(error) => {
+                        setPdfLoading(false);
+                        setPdfError(error instanceof Error ? error.message : "Could not render this PDF.");
+                      }}
+                      loading={null}
+                      error={null}
+                      className="silvera-pdf-document"
+                    >
+                      <PdfPage
+                        key={`${selectedSource.document_id}-${(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}`}
+                        pageNumber={(selectedSource as AskSource & { page_number?: number | null }).page_number ?? 1}
+                        renderTextLayer
+                        renderAnnotationLayer
+                        onRenderSuccess={() => setPdfLoading(false)}
+                        width={Math.max(280, Math.min(760, (typeof window !== "undefined" ? window.innerWidth : 1200) * 0.52))}
+                      />
+                    </PdfDocument>
+                  )}
                 </div>
               </div>
             </div>
@@ -1821,7 +2105,9 @@ function App() {
             <div className="source-modal-footer">
               <span>◇ Stored and processed locally</span>
               <div className="source-modal-actions">
-                <button className="source-open-original" onClick={openOriginalDocument} type="button">Open original ↗</button>
+                <button className="source-open-original" onClick={openOriginalDocument} type="button">
+                  {isPdfSource ? "Open original ↗" : "Download original ↗"}
+                </button>
                 <button className="source-done-button" onClick={() => setSelectedSource(null)} type="button">Done</button>
               </div>
             </div>
